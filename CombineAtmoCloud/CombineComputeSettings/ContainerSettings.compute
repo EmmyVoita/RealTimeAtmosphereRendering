@@ -1,0 +1,13 @@
+#ifndef CONTAINER_SETTINGS
+#define CONTAINER_SETTINGS
+
+float3 boundsMin;
+float3 boundsMax;
+
+float3 boundsMin_Atmo;
+float3 boundsMax_Atmo;
+//float3 atmoBoundsMin;
+//float3 atmoBoundsMax;
+
+
+#endif

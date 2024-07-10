@@ -1,0 +1,11 @@
+// Animation settings
+float previous_time = 0.0;
+float timeScale;
+float baseSpeed;
+float detailSpeed;
+float CURL_SPEED;
+
+float3 WIND_DIR;
+float WIND_SPEED;
+
+const float offsetSpeed = 1 / 100.0;

@@ -1,0 +1,21 @@
+
+static const uint BAYER_LIMIT = 16;
+static const uint BAYER_LIMIT_H = 4;
+
+// 4 x 4 Bayer matrix
+static const int bayerFilter[BAYER_LIMIT] = {
+	 0,  8,  2, 10,
+	12,  4, 14,  6,
+	 3, 11,  1,  9,
+	15,  7, 13,  5
+};
+
+bool writeToPixel(int2 fragCoord, int iFrame)
+{
+    int2 iFragCoord = int2(fragCoord);
+    uint index = iFrame % BAYER_LIMIT;
+    return (((iFragCoord.x + BAYER_LIMIT_H * iFragCoord.y) % BAYER_LIMIT) == bayerFilter[index]);
+}
+
+
+
