@@ -1,4 +1,0 @@
-// Performance Settings:
-int frameCounter;
-int frameInterval;
-
