@@ -13,5 +13,5 @@ https://docs.google.com/document/d/1OJmXZ0w5BSLsnRvusRYs6ti7tbqTQ3eGGJp53MA0aws/
 **For brief video overview and executable** (note: executable is of an older version that doesn't have working temporal reprojection):
 https://padlet.com/sweetpotatoelove/portfolio-padlet-cicp6bqhnfroqlcb
 
-**For full project can also download here:**
+**For full project, you can also download here:**
 https://www.dropbox.com/scl/fi/op264xbptix1gm943wtsg/Default-Shaders-Copy.zip?rlkey=pqxwne7nqb5li4wy8555s8t2g&st=sah69op4&dl=0
