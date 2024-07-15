@@ -1,0 +1,846 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel AtmosphereCompute
+#include "../../Includes/Math.cginc"
+#include "../../Includes/RayMarch.cginc"
+#include "../../Includes/LightMath.cginc"
+#include "../../Includes/AtmoRender.cginc"
+//#include "../../Includes/DeepShadowMap/DeepShadowMap.cginc"
+#include "UnityCG.cginc"
+
+
+
+Texture2D<float4> _MainTex;
+Texture2D<float> BlueNoise;
+Texture2D<float4> WorldPosition;
+Texture2D<float4> LightDepth;
+
+Texture2D<float> MainShadowmapCopy;
+SamplerState sampler_MainShadowmapCopy;
+
+SamplerState sampler_MainTex;
+SamplerState sampler_BlueNoise;
+SamplerState sampler_WorldPosition;
+SamplerState sampler_LightDepth;
+
+RWTexture2D<float4> Result;
+
+
+// Matrix
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+// Shadowing
+float4x4 Light_VP;
+
+// Internal Parameters
+int frame_counter = 1;
+//float2 _ScreenParams;
+float4 _LightColor0;
+//float3 _WorldSpaceLightPos0;
+//float3 _WorldSpaceCameraPos;
+
+
+// Atmosphere Parameters
+float atmosphere_radius;
+float planet_radius;
+float3 planet_center;
+
+float ray_offset_strength;
+int PRIMARY_STEP_COUNT;
+int LIGHT_STEP_COUNT;
+float density_multiplier = 1;
+float density_falloff = 2.0;
+int max_view_ray_samples;
+float light_intensity;
+
+
+float MAX_DIST = 10000;
+
+float3 cuttoff_threshold;
+uint2 current_ss_id;
+
+// --------------------------------- Deep Shadow Map ---------------------------------
+
+
+RWStructuredBuffer<uint> NumberBuffer;
+RWStructuredBuffer<float2> DepthBuffer;
+
+float4x4 _LightVP;
+sampler2D _BlurShadowTexture;
+
+
+// ------------------------------- Deep Shadow Map End -------------------------------
+
+
+
+#ifndef NUM_DIR_LIGHTS
+#define NUM_DIR_LIGHTS 1
+#endif
+
+#ifndef USE_PLACEHOLDER_SURFACE 
+#define USE_PLACEHOLDER_SURFACE 0
+#endif
+
+
+/*
+void HandleDeepShadowMap(float3 world_pos, float transmittance)
+{
+    // Transform the current pixel position from world space to light space
+    float4 lightPos = mul(_LightVP, float4(world_pos, 1.0f));
+    // Remap from [-1,1] to [0,1]
+    float3 posInLight = lightPos * 0.5f + 0.5f;
+    // Scale the xy components by the shadow map resolution to get the correct texture coordinate
+    posInLight.xy *= Dimension;
+    // Calculate the index into the buffer [2D -> 1D]
+    uint idx = ((uint) posInLight.y) * Dimension + (uint) posInLight.x;
+    // Calculate the offset into the buffer 
+    uint offset = idx * NUM_BUF_ELEMENTS;
+    
+    uint originalVal;
+    // Atomic operation to increment the value in the NumberBuffer
+    InterlockedAdd(NumberBuffer[idx], 1, originalVal);
+    // Clamp the value to the maximum number of elements allowed in the buffer
+    originalVal = min(NUM_BUF_ELEMENTS - 1, originalVal);
+    // Store the depth value in the DepthBuffer
+    DepthBuffer[offset + originalVal].x = posInLight.z;
+    DepthBuffer[offset + originalVal].y = transmittance; ///_HairAlpha;
+    
+    //return fixed4(posInLight.z, 0, 0, 1);
+}*/
+
+
+
+float ShadowFactor(float3 ws_pos)
+{
+    //-----------------------------------------------------------------------------------------------------------------
+    //Shadowing
+    //-----------------------------------------------------------------------------------------------------------------
+    //current_sample_pos * 1000;
+    float vDepth = distance(_WorldSpaceCameraPos, float4(ws_pos.xyz, 1.0));
+    
+    float4 near    = float4 (vDepth >= _LightSplitsNear);								// Checking if the pixel is further away than the near plane for each cascaded				
+    float4 far     = float4 (vDepth < _LightSplitsFar);									// same but for closer than far plane for each cascaded
+    float4 weights = near * far;														// only have one in xyzw for a depth that is both further away than the near plane and closer than far plane (in subfrusta)
+
+    // Calculate the shadowmap UV coordinate for each cascaded. unity_WorldToShadow is a array of four matrices, 
+    // containting the world to camera space transformation matrix for the directional light camera. Each entery of
+    // the array is for one of the cascaded cordinate systems. 
+    
+
+    float3 shadowCoord0 = mul(unity_WorldToShadow[0], float4(ws_pos.xyz, 1.0)).xyz;
+    float3 shadowCoord1 = mul(unity_WorldToShadow[1], float4(ws_pos.xyz, 1.0)).xyz;
+    float3 shadowCoord2 = mul(unity_WorldToShadow[2], float4(ws_pos.xyz, 1.0)).xyz;
+    float3 shadowCoord3 = mul(unity_WorldToShadow[3], float4(ws_pos.xyz, 1.0)).xyz;
+
+
+    float3 coord =									// A smart way to avoid branching. Calculating the final shadow texture uv coordinates per fragment
+    shadowCoord0 * weights.x +					// case: Cascaded one
+    shadowCoord1 * weights.y +					// case: Cascaded two
+    shadowCoord2 * weights.z +					// case: Cascaded three
+    shadowCoord3 * weights.w;					// case: Cascaded four
+
+    float shadow_mask = MainShadowmapCopy.SampleLevel(sampler_MainShadowmapCopy,coord.xy,0).r;
+
+    // The current depth represents the depth value of the current sample world position as seen from the light's perspective.
+    // The goal is to comapre if this value is further than the value stored in the depth texture. 
+    // If I also have the worldposition in that texture, then i should be able to apply the light_VP to that world pposition and check the z val
+    
+    bool isInsideShadowMap = (shadowCoord0.x >= -1.0 && shadowCoord0.x <= 1.0) && (shadowCoord0.y >= -1.0 && shadowCoord0.y <= 1.0);
+    
+    return coord.z;
+    
+    if(isInsideShadowMap)
+    { 
+        
+        if (shadow_mask >= 0 && shadow_mask <= 1)
+        {
+            if (shadow_mask == coord.z)
+            {
+                return 0.8;
+            }
+            else if (shadow_mask < coord.z)
+            {
+                return 0.1;
+            }
+            
+            float shadow_factor = shadow_mask > coord.z ? 1.0 : 0.0;
+            return shadow_factor;
+        }
+        return 0.2;
+        
+        
+    } 
+    
+    return 0.0;
+}
+
+
+//How much light makes it from xa (ray_origin) to xb (intersecxtion_point) without being absorbed or scattered?"
+float3 OpticalDepthLight(float3 ray_origin, float3 light_dir, int STEP_COUNT, float4 SCALED_HEIGHTS, PlanetData planet_data, float4 world_pos_depth, DirectionalLight dl, float3 camera_pos)
+{
+    // Shadow factor TO DO LATER
+    
+
+
+    // The function RayIntersectSphereLight calculates where the light ray intersects the atmosphere and computes the step size;
+    float actual_step_size = RayIntersectSphereLight(ray_origin, light_dir, planet_data.total_radius, STEP_COUNT);
+    float virtual_step_size = actual_step_size * planet_data.planet_scale;
+    float ray_pos = actual_step_size * 0.5;
+
+
+    // Optical Depth: refers to the amount of light blocked passing through a medium. It is the difference between the inital luminance and final luminance.
+    // An value of 0 means that no absorption or scattering occurs, so all of the light makes it through (100% transmission).
+    // An value of 1 means that all of the  light has been absorbed or scattered, so none of it makes it through (0% transmission).
+    float3 optical_depth = 0.0;
+
+    /* 
+    Density of the Atmosphere: The density of the atmosphere determines how many particles (molecules, aerosols, etc.) are present in a given volume of air. 
+    In simple terms, a denser atmosphere means there are more particles that can interact with and scatter light. The relationship   
+    between optical depth and density in the atmosphere is typically exponential, meaning that as the density increases, the optical depth 
+    increases accordingly. A denser atmosphere will have more particles for light to interact with, resulting in greater attenuation. 
+    */
+
+    /*
+    Implementation:. To calculate the optical depth along a ray, accumulate the densityat each step along the ray. This accumulation process is 
+    essentially accounting for how much the light has interacted with the medium (in this case, the atmosphere) as it travels along the ray.
+    */
+
+    for (int i = 0; i < STEP_COUNT; i++)
+    {   
+        // Current sample position along the ray
+        float3 current_sample_pos = ray_origin + light_dir * ray_pos;
+
+     
+        //-----------------------------------------------------------------------------------------------------------------
+     
+        //-----------------------------------------------------------------------------------------------------------------
+
+        // Calculate the height of the current sample pos
+        float current_height = length(current_sample_pos) - planet_data.planet_radius;
+        //float current_height = length(current_sample_pos) - planet_data.planet_radius;
+
+        // Calculate the density at the current position in the atmosphere. In this model the density is simply
+        // a function of height. We use a modifed formula for ozone to better simulate the behavior of the atmosphere.
+        float3 density = float3(exp(-current_height / SCALED_HEIGHTS.xy), 0.0);
+        float denom = (SCALED_HEIGHTS.z - current_height) / SCALED_HEIGHTS.w;
+        density.z = (1.0 / (denom * denom + 1.0)) * density.x;
+
+        // Multiply the density by the step size. 
+        // This represents the density of particles at the current position along the primary ray.
+        density *= virtual_step_size;
+
+        // add the density to the total optical depth
+        optical_depth += density; // * (1.0 - shadow);
+
+        // increment the position along the ray
+        ray_pos +=  actual_step_size;
+    }
+
+    /* transmittance.x corresponds to the Rayleigh extinction coefficient's transmittance.
+    transmittance.y corresponds to the Mie extinction coefficient's transmittance.
+    transmittance.z corresponds to the ozone extinction coefficient's transmittance.*/
+    return optical_depth;
+}
+
+
+float2 ComputePhase(float3 ray_dir, float3 light_dir, bool allow_mie)
+{
+    // Calculate the Rayleigh and Mie phases.
+    // This is the color that will be scattered for this ray
+    // mu, mumu and gg are used quite a lot in the calculation, so to speed it up, precalculate them
+    float mu = dot(ray_dir, light_dir);
+    float mumu = mu * mu;
+    float gg = g * g;
+    float phase_rayleigh = 3.0 / (50.2654824574) * (1.0 + mumu);
+    float phase_mie = allow_mie ? 3.0 / (25.1327412287) * ((1.0) - gg) * (mumu + 1.0) / (pow(max(0.0, (1.0 + gg - 2.0 * mu * g)), 1.5) * (2.0 + gg)) : 0.0;
+    
+    return float2(phase_rayleigh, phase_mie);
+}
+
+
+float ComputeIlluminance(DirectionalLight dl)
+{   
+    // illuminance (considering directional light sources) Ei
+    // Angle (θ): The angle between the direction of the light (given by the direction vector 
+    // of the directional light) and the normal vector of the surface at the point of interest.
+    // Distance (r): The distance from the light source to the point on the surface.
+    
+    // the normal between the view ray direction and the light direction
+    //float normal = 
+    //float theta = acos(dot(DIR_LIGHTS[i].direction, normal));
+    //float E = DIR_LIGHTS[i].intensity * cos(theta) / (r^2);
+
+    float E = dl.intensity / 3.14;
+
+    return E;
+}
+
+
+float3 RenderScene(float3 ray_origin, float3 ray_direction, float3 scene_color, float max_dist, PlanetData planet_data, int PRIMARY_STEP_COUNT, int LIGHT_STEP_COUNT, float4 world_pos_depth, DirectionalLight DIR_LIGHTS[NUM_DIR_LIGHTS], float3 cuttoff_threshold)
+{   
+
+    ray_origin -= planet_data.planet_center;
+
+
+    //-----------------------------------------------------------------------------------------------------------------
+    // Adjust absorption heights based on planet / atmosphere scale
+    //-----------------------------------------------------------------------------------------------------------------
+
+
+    /*
+        Explanation:The values used for the heights (how far to go up before the scattering has no effect) are 
+        based on the earths actual values. To produce accurate results for different planet sizes, the height 
+        values need to be scaled based on planet scale. The scaled heights are packed in a float4
+        to reduce the number of parameters passed to the OpticalDepthLight function.
+    */
+
+    // Scale the heights (how far to go up before the scattering has no effect)
+    float SCALED_HEIGHT_RAY = HEIGHT_RAY / (planet_data.planet_scale * planet_data.atmosphere_scale);
+    float SCALED_HEIGHT_MIE = HEIGHT_MIE / (planet_data.planet_scale * planet_data.atmosphere_scale);
+    float SCALED_HEIGHT_ABSORPTION = HEIGHT_ABSORPTION * (planet_data.planet_scale * planet_data.atmosphere_scale);
+    float SCALED_ABSORPTION_FALLOFF = ABSORPTION_FALLOFF / (planet_data.planet_scale * planet_data.atmosphere_scale);
+    float4 SCALED_HEIGHTS = float4(SCALED_HEIGHT_RAY, SCALED_HEIGHT_MIE, SCALED_HEIGHT_ABSORPTION, SCALED_ABSORPTION_FALLOFF);
+
+    //-----------------------------------------------------------------------------------------------------------------
+    // Calculate the Ray Length -> float2(first_intersect, second_intersect)
+    //-----------------------------------------------------------------------------------------------------------------
+    
+
+    /*
+        Explnation: For our ray marching summation we want the ray marching to stop if it intersects the ground. This involves 
+        calculating the distance that at which the ray leaves the atmosphere and then modifying that distance if it hits the ground
+        along the way.
+    */
+
+    /*
+        Implementation: Calculate the intersection point with the atmosphere assuming the atmosphere can be represented
+        by a sphere. Use the quadratic formula to calculate the first intersection (sphere entry) and second intersection
+        (sphere exit). 
+
+        The max_dist, computed in the RenderSkyLight function, is either some very large number if the ray does not 
+        intersect the ground or the distance to the ground intersection. Setting max_dist to a very large value if it does
+        not intersect the ground ensures that te ray is able to travel through the entire atmosphere without being cutoff.
+        The max_dist is incorporated is applied to the second intersection using the min function.
+
+        There also are a couple of cases for early exits:
+        1. Stop early if the ray does not intersect the sphere, and return the scene color. 
+        2. If the ray does not intersect the atmosphere, then return the scene color. 
+    */
+
+    // Calculate the start and end position of the ray, as a distance along the ray. We do this with a ray sphere intersect
+    float a = dot(ray_direction, ray_direction);
+    float b = 2.0 * dot(ray_direction, ray_origin);
+    float c = dot(ray_origin, ray_origin) - (planet_data.total_radius * planet_data.total_radius);
+    float d = (b * b) - 4.0 * a * c;
+
+    // Early out if ray doesn't intersect atmosphere.
+    if (d < 0.0)
+        return scene_color;
+    
+    float2 ray_length = float2( max((-b - sqrt(d)) / (2.0 * a), 0.0), min((-b + sqrt(d)) / (2.0 * a), max_dist));
+
+    if(ray_length.x > ray_length.y)
+        return scene_color;
+   
+    // prevent the mie glow from appearing if there's an object in front of the camera
+    bool allow_mie = max_dist > ray_length.y;
+
+    // For calculations using the viewer's position, the actual position used is dependent on whether the viewer is inside the atmosphere.
+    // If the viewer is inside, use viewer's position. If the viewer is outside, use the intersection point with the atmosphere.
+    // This is accomplished by taking the max between the first intersection point and 0.
+    ray_length.x = max(ray_length.x, 0.0);
+
+    // Set the intersect to the ground intersect (max_dist) when applicable.
+    ray_length.y = min(ray_length.y, max_dist);
+
+ 
+    //-----------------------------------------------------------------------------------------------------------------
+    // Ray march step size and starting position
+    //-----------------------------------------------------------------------------------------------------------------
+
+
+    // Calculate the first intersection point along the ray. Intersection with the atmosphere.
+    float3 intersection_point = ray_origin + ray_direction * ray_length.x;
+    float3 end_point = ray_origin + ray_direction * ray_length.y;
+
+
+    // Clip the atmosphere:
+    // Check if the absolute value of the x-coordinate of the intersection point is greater than some threshold.
+    if (abs(intersection_point.x) > cuttoff_threshold.x || abs(intersection_point.z) > cuttoff_threshold.z || abs(intersection_point.y) < cuttoff_threshold.y- planet_data.planet_center.y) return scene_color; // Return black color.
+    //if ( intersection_point.y < cuttoff_threshold.y - planet_data.planet_center.y) return scene_color;
+    // get the step size of the ray
+    float actual_step_size_p = (ray_length.y - ray_length.x) / float(PRIMARY_STEP_COUNT);
+    float virtual_step_size_p = actual_step_size_p * planet_data.planet_scale;
+
+    // next, set how far we are along the ray, so we can calculate the position of the sample
+    // if the camera is outside the atmosphere, the ray should start at the edge of the atmosphere
+    // if it's inside, it should start at the position of the camera
+    // the min statement makes sure of that
+    float ray_pos_p = ray_length.x + actual_step_size_p * 0.5;
+
+
+    //-----------------------------------------------------------------------------------------------------------------
+    // Ray march variables
+    //-----------------------------------------------------------------------------------------------------------------
+
+    // Optical Depth: refers to the amount of light blocked passing through a medium. It is the difference between the inital luminance and final luminance.
+    // An value of 0 means that no absorption or scattering occurs, so all of the light makes it through (100% transmission).
+    // An value of 1 means that all of the  light has been absorbed or scattered, so none of it makes it through (0% transmission).
+    float3 optical_depth = 0.0;
+
+    // these are the values we use to gather all the scattered light
+    float3 accumulated_rayleigh = 0;
+    float3 accumulated_mie = 0;
+    float accumulated_shadow_factor = 0.0;
+
+    //-----------------------------------------------------------------------------------------------------------------
+    // Ray Marching (Summation of In-Scattered Light)
+    //-----------------------------------------------------------------------------------------------------------------
+
+    // Compute the amount of in scattering from the camera to the ground intersection (integral from 0 to ||p-c||)
+    for(int i = 0; i < PRIMARY_STEP_COUNT; i++)
+    {   
+        //-----------------------------------------------------------------------------------------------------------------
+        // Calculate the Current Sample Position Along the Ray and the Current Height
+        //-----------------------------------------------------------------------------------------------------------------
+
+        // calculate where we are along this ray
+        float3 primary_sample_pos = ray_origin + ray_direction * ray_pos_p;
+
+        float current_height = length(primary_sample_pos) - planet_data.planet_radius;
+
+        //-----------------------------------------------------------------------------------------------------------------
+        // Compute the attenuation along the primary ray
+        //-----------------------------------------------------------------------------------------------------------------
+
+        // Calculate the density at the current position in the atmosphere. In this model the density is simply
+        // a function of height. We use a modifed formula for ozone to better simulate the behavior of the atmosphere.
+        float3 density = float3(exp(-current_height / SCALED_HEIGHTS.xy), 0.0);
+        float denom = (SCALED_HEIGHTS.z - current_height) / SCALED_HEIGHTS.w;
+        density.z = (1.0 / (denom * denom + 1.0)) * density.x;
+
+        // Multiply the density by the step size. 
+        // This represents the density of particles at the current position along the primary ray.
+        density *= virtual_step_size_p;
+
+        // add the density to the total optical depth
+        optical_depth += density;
+
+        // attenuation = the current optical depth multiplied by the extinction coefficent.accounts for the attenuation  
+        // (reduction in intensity) of light due to both scattering and absorption as it propagates through a medium.
+        //float3 r = (-(sigma_t.x * optical_depth.x) - (sigma_t.y * optical_depth.y) - (sigma_t.z * optical_depth.z));
+        float3 r = (-(BETA_RAYLEIGH * optical_depth.x) - (BETA_MIE * optical_depth.y) - (BETA_ABSORPTION  * optical_depth.z));
+        //float3 r = (-(BETA_RAYLEIGH * optical_depth.x) - (BETA_MIE * optical_depth.y) - (BETA_ABSORPTION  * optical_depth.z));
+
+        //attenuation or transmittance 
+        
+        float3 primary_attenuation = exp(r);
+
+    
+        //-----------------------------------------------------------------------------------------------------------------
+        // Compute The Attenuation For Each Light Source And Accumulate In-Scattered Light
+        //----------------------------------------------------------------------------------------------------------------- 
+
+        /*
+            Optimiazation: When you have more than one light source, the number of computations increases significantly for a 
+            couple reasons. Calculations involving directional lights are no longer constant, as they have to be performed 
+            for each directional light in the scene. Thus, the phase and illuminance calculations no longer adhere to the 
+            distributive property of summation. And rather than just computing them once outside of the summation, they need to 
+            be calculated for each march along the primary ray. If there is only 1 light source, it would be more optimal 
+            to have a seperate method for computing the final luminance.
+            
+            Explanation: This next section of the code accumulates the in-scattering for rayleigh and mie based on the third equation
+            in the included link.
+
+            Link: https://sebh.github.io/publications/egsr2020.pdf 
+        */
+
+        // Single directional light optimization
+        #if NUM_DIR_LIGHTS == 1
+        
+            float3 optical_depth_light = OpticalDepthLight(primary_sample_pos, DIR_LIGHTS[0].direction, LIGHT_STEP_COUNT, SCALED_HEIGHTS,planet_data, world_pos_depth,  DIR_LIGHTS[0], ray_length.x);
+            
+
+            r = (-(BETA_RAYLEIGH * optical_depth_light.x) - (BETA_MIE * optical_depth_light.y) - (BETA_ABSORPTION  * optical_depth_light.z));
+            float3 light_attenuation = exp(r);
+
+            // max between shadow factor and mimumum ambient which is 0.3 in this case
+            //float shadow_mask = max(0.3, 1.0 - ShadowFactor(primary_sample_pos * planet_data.planet_scale));
+        
+            // full shadow -> shadow factor = 1. transmittance * 0
+            // no shadow -> shadow factor = 0. transmittance * 1
+            //  * planet_data.planet_scale
+            //float shadow_mask = (1 - ShadowFactor(primary_sample_pos));
+            //if (shadow_mask == 0)
+                    //return float3(1, 0, 0);
+            
+            //float shadow_mask = max(0.0, 1.0 - ShadowFactor(primary_sample_pos));
+            //float test_shadow = ShadowFactor(primary_sample_pos);
+            /*if (test_shadow != 0 && test_shadow != 0.8 && test_shadow != 0.2 && test_shadow != 0.1)
+            {
+                // value in depth buffer is less than world pos converted to light space, meaning in shadow.
+                return float3(1, 0, 0);
+            }
+            else if (test_shadow == 0.8)
+            {
+                // both depth values are equal
+                return float3(0, 1, 0);
+            }
+            else if (test_shadow == 0.2)
+            {
+                //value it depth buffer is outside of 0 to 1 range
+                return float3(0, 0, 1);
+            }
+            else if (test_shadow == 0.1)
+            {
+                // value of shadow_mask < coord.z
+                return float3(1, 1, 1);
+            }
+            */
+            float shadow_mask = 1;
+            accumulated_shadow_factor += shadow_mask;
+
+            
+            
+            // accumulate the in-scattered light
+            // multiplyy by step size to account for when samples are taken closer together when near objects.
+            accumulated_rayleigh += density.x * primary_attenuation * light_attenuation * shadow_mask * actual_step_size_p;
+            accumulated_mie += density.y * primary_attenuation * light_attenuation * shadow_mask * actual_step_size_p;
+
+        #else
+
+            for(int j = 0; j < NUM_DIR_LIGHTS; j++)
+            {   
+                float3 optical_depth_light = OpticalDepthLight(primary_sample_pos, DIR_LIGHTS[j].direction, LIGHT_STEP_COUNT, SCALED_HEIGHTS,planet_data, world_pos_depth, DIR_LIGHTS[j], ray_length.x);
+
+                float2 phase = ComputePhase(ray_direction, DIR_LIGHTS[j].direction, allow_mie);
+                float illuminance = ComputeIlluminance(DIR_LIGHTS[j]);
+
+                r = (-(BETA_RAYLEIGH * optical_depth_light.x) - (BETA_MIE * optical_depth_light.y) - (BETA_ABSORPTION * optical_depth_light.z));
+        
+                //float shadow_mask = max(0.3, 1.0 - ShadowFactor(primary_sample_pos));
+                //accumulated_shadow_factor += shadow_mask;
+
+                // accumulate the in-scattered light
+                accumulated_rayleigh += density.x * primary_attenuation * exp(r) * phase.x * illuminance;
+                accumulated_mie += density.y * primary_attenuation * exp(r) * phase.y * illuminance;
+            }
+
+        #endif
+ 
+        // increment the primary ray
+        ray_pos_p += actual_step_size_p;
+    }
+
+
+    //-----------------------------------------------------------------------------------------------------------------
+    // Compute the Final Luminance. 
+    //----------------------------------------------------------------------------------------------------------------- 
+    
+    // Calculate the average shadow factor along the ray
+    float average_shadow_factor = accumulated_shadow_factor / float(PRIMARY_STEP_COUNT);
+    //return float3(1, 1, 1) * average_shadow_factor;
+    // Compute the Opacity
+    float3 opacity = exp( -(BETA_RAYLEIGH  * optical_depth.y + BETA_MIE * optical_depth.x + BETA_ABSORPTION * optical_depth.z));
+    //opacity *= min(1.0, average_shadow_factor);
+
+
+    #if NUM_DIR_LIGHTS == 1
+        
+        /*
+        Explanation: If using the single directional light optimization multiply the summation by the constants
+        */
+
+        float2 phase = ComputePhase(ray_direction, DIR_LIGHTS[0].direction, allow_mie);
+        float illuminace = ComputeIlluminance(DIR_LIGHTS[0]);
+
+        
+        float3 final_luminance = ( phase.x * SIGMA_RAYLEIGH_S * accumulated_rayleigh 
+                               + phase.y * SIGMA_MIE_S * accumulated_mie
+                               + optical_depth.x * BETA_AMBIENT                    )
+                               * illuminace + scene_color * opacity;
+
+    #else
+
+        /*
+        Explanation: No phase or illuminance here as it is already included in the in-scattering summation.
+        */
+
+        float3 final_luminance = (   SIGMA_RAYLEIGH_S * accumulated_rayleigh 
+                                + SIGMA_MIE_S * accumulated_mie
+                                + optical_depth.x * BETA_AMBIENT                    )
+                                + scene_color * opacity;
+
+    #endif
+
+    return final_luminance;
+}
+
+//-----------------------------------------------------------------------------------------------------------------
+// Calculating Inscatter in the Direction of the Surface Normal (Skylight):
+//----------------------------------------------------------------------------------------------------------------- 
+
+/*
+    Explanation: The first calculation (Calculating Inscatter in the Direction of the Ray (Camera View)) focuses 
+    on the specific path from your eyes to a point in the distance, considering what happens along that path.
+    The second calculation focuses on the overall ambient lighting from the entire sky at your location.
+*/
+
+float3 SkyLight(float3 sample_pos, float3 surface_normal, float3 scene_color, PlanetData planet_data, int PRIMARY_STEP_COUNT, int LIGHT_STEP_COUNT, float4 world_pos_depth, DirectionalLight DIR_LIGHTS[NUM_DIR_LIGHTS], float3 cuttoff_threshold)
+{
+    // slightly bend the surface normal towards the light direction
+    surface_normal = normalize(mix(surface_normal, DIR_LIGHTS[0].direction, 0.6));
+
+    float3 luminance = RenderScene(sample_pos, surface_normal, scene_color.rgb, 10.0 * planet_data.total_radius, planet_data, PRIMARY_STEP_COUNT, LIGHT_STEP_COUNT, world_pos_depth, DIR_LIGHTS, cuttoff_threshold);
+
+    return luminance;
+}
+
+
+float4 RenderSkyLight(float3 pos, float3 dir, float3 background, PlanetData planet_data, int PRIMARY_STEP_COUNT, int LIGHT_STEP_COUNT, float4 world_pos_depth, DirectionalLight DIR_LIGHTS[NUM_DIR_LIGHTS], float3 cuttoff_threshold)
+{
+    // the color to use, w is the scene depth
+    float4 color = float4(background, 1000000);
+
+    // get where the ray intersects the planet
+    float2 planet_intersect = RaySphereIntersect(pos, dir, planet_data.planet_radius, planet_data.planet_center); 
+
+    // if the ray hit the planet, set the max distance to that ray
+    if (0.0 < planet_intersect.y || length(world_pos_depth.xyz) > 0) 
+    {
+        float3 sample_pos;
+
+        #if USE_PLACEHOLDER_SURFACE == 0
+
+            if(length(world_pos_depth.xyz) > 0)
+            {
+                color.w = max(length(world_pos_depth.xyz), 0.0);
+                sample_pos = world_pos_depth.xyz - planet_data.planet_center;
+            }
+
+        #else
+
+            if(length(world_pos_depth.xyz) > 0)
+            {
+                color.w = max(length(world_pos_depth.xyz), 0.0);
+                sample_pos = world_pos_depth.xyz - planet_data.planet_center;
+            }
+            else
+            {   
+                // sample position, where the pixel is
+                color.w = max(planet_intersect.x, 0.0);
+                sample_pos = pos + (dir * planet_intersect.x) - planet_data.planet_center;
+            }
+
+        #endif
+        
+        
+        if(dot(dir, DIR_LIGHTS[0].direction) > 0.9998)
+            color.xyz = float3(10,10,10);
+
+        
+        
+        // and the surface normal
+        float3 surface_normal = normalize(sample_pos);
+        
+        // get the color of the sphere
+        color.xyz = background;
+        
+        // get wether this point is shadowed, + how much light scatters towards the camera according to the lommel-seelinger law
+        float3 N = surface_normal;
+        float3 V = -dir;
+        float3 L = DIR_LIGHTS[0].direction;
+        float dotNV = max(0.000001, dot(N, V));
+        float dotNL = max(0.000001, dot(N, L));
+        float shadow = dotNL / (dotNL + dotNV);
+        
+        // apply the shadow
+        // JUST COMMENTING THIS OUT TO REMOVE POSSIBLE FACTORS, UNCOMMENT WHEN YOU FIX DEPTH
+        color.xyz *= shadow;
+        
+        float3 sky_light = SkyLight(sample_pos, surface_normal, background.rgb, planet_data, PRIMARY_STEP_COUNT, LIGHT_STEP_COUNT, world_pos_depth, DIR_LIGHTS, cuttoff_threshold);
+        // apply skylight
+        //color.xyz += clamp(sky_light.xyz * float3(0.1, 0.1, 0.1), 0.0, 1.0);
+        color.xyz += clamp(sky_light.xyz * float3(0.1, 0.1, 0.1), 0.0, 1.0);
+    }
+
+    return color;
+
+}
+
+
+
+
+
+uint2 CalculatePixelID(uint3 id, uint frameNum)
+{
+     // Calculate the corresponding block position
+    uint blockX = id.x / 4;
+    uint blockY = id.y / 4;
+
+    // Calculate the pixel position within the block based on the frameCounter
+    uint column = (frameNum - 1) % 4;
+    uint row = (frameNum - 1) / 4;
+
+    // Calculate the pixel position within the 4x4 block
+    uint pixelX = (id.x % 4) + column * 4 + blockX * 16;
+    uint pixelY = (id.y % 4) + row * 4 + blockY * 16;
+
+    return uint2(pixelX, pixelY);
+}
+
+
+[numthreads(8,8,1)]
+void AtmosphereCompute (uint3 id : SV_DispatchThreadID)
+{
+    // Determine which pixel out of 4x4 block we are rendering
+    //current_ss_id = CalculatePixelID(id, frame_counter);
+
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [0,1] range
+    //float2 container_uv = (current_ss_id.xy + 0.5) / float2(width, height);
+    //float2 ray_uv = float2((current_ss_id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+    
+    float2 container_uv = (id.xy + 0.5) / float2(width, height);
+    float2 ray_uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(ray_uv, _CameraToWorld, _CameraInverseProjection);
+
+
+    //
+    // Get the world position from the screen space world position texture
+    float4 world_pos_depth = WorldPosition.SampleLevel(sampler_WorldPosition, container_uv, 0).rgba;
+
+    //float shadow = MainShadowmapCopy.SampleLevel(sampler_MainShadowmapCopy, container_uv,0).r;
+    
+
+    PlanetData planet_data = CreatePlanetData(planet_center, planet_radius, atmosphere_radius);
+
+    float3 background = _MainTex.SampleLevel(sampler_MainTex, container_uv, 0).rgb;
+    
+    // sun data
+    float3 light_dir = normalize(_WorldSpaceLightPos0.xyz);
+    float3 light_intensity_3 = float3(light_intensity,light_intensity,light_intensity);
+
+    
+     // Create directional light for sun and moon:
+    DirectionalLight scene_dls[NUM_DIR_LIGHTS];
+    scene_dls[0] = CreateDirectionalLight(light_dir, light_intensity, Light_VP);
+    //scene_dls[1] = CreateDirectionalLight(float3(0,1,0), light_intensity * 0.12);
+
+
+
+    float4 scene_color = RenderSkyLight(ray.origin, ray.direction, background.rgb, planet_data, PRIMARY_STEP_COUNT, LIGHT_STEP_COUNT, world_pos_depth, scene_dls,  cuttoff_threshold);
+
+    float3 col = 0;
+    col += RenderScene(ray.origin, ray.direction, scene_color.rgb, scene_color.a, planet_data, PRIMARY_STEP_COUNT, LIGHT_STEP_COUNT, world_pos_depth, scene_dls,  cuttoff_threshold);
+    col = 1.0 - exp(-col);
+    
+   
+    //
+    //Result[id.xy] = float4(1.0,1.0,1.0,1.0);   
+    Result[id.xy] = float4(col.xyz,1.0);   
+    //Result[current_ss_id] = float4(1.0,1.0,1.0,1.0) * shadow;
+    
+    /*uint2 buffer_id = uint2(current_ss_id.x / 4, current_ss_id.y / 4);
+    for (int i = 0; i < PRIMARY_STEP_COUNT; i++)
+    {
+        SetValue(buffer_id.xy, i, 0.0f, width, height);
+    }*/
+    
+    /*
+    if(current_ss_id.x < (width/2))
+    {
+        col += CalculateScattering(ray.origin, ray.direction, scene_color.w, scene_color.xyz, light_dir, light_intensity_3, planet_data, accumulated_weight, PRIMARY_STEP_COUNT, LIGHT_STEP_COUNT, cuttoff_threshold);
+        col = 1.0 - exp(-col);
+    }
+    else
+    {
+        // Create directional light for sun and moon:
+        DirectionalLight scene_dls[NUM_DIR_LIGHTS];
+        scene_dls[0] = CreateDirectionalLight(light_dir, light_intensity);
+        //scene_dls[1] = CreateDirectionalLight(float3(1,0,0), light_intensity * 0.1);
+        //scene_dls[2] = CreateDirectionalLight(float3(1,1,0), light_intensity * 2);
+        //scene_dls[3] = CreateDirectionalLight(float3(-1,0,0), light_intensity * 0.2);
+        col += RenderScene(ray.origin, ray.direction, background.rgb, 100000, planet_data, PRIMARY_STEP_COUNT, LIGHT_STEP_COUNT, world_pos_depth, scene_dls,  cuttoff_threshold);
+        col = 1.0 - exp(-col);
+    }*/
+
+    // Create directional light for sun and moon:
+        //DirectionalLight scene_dls[NUM_DIR_LIGHTS];
+        //scene_dls[0] = CreateDirectionalLight(light_dir, light_intensity);
+        //scene_dls[1] = CreateDirectionalLight(float3(1,0,0), light_intensity * 0.1);
+        //scene_dls[2] = CreateDirectionalLight(float3(1,1,0), light_intensity * 2);
+        //scene_dls[3] = CreateDirectionalLight(float3(-1,0,0), light_intensity * 0.2);
+    //float3 test_world_pos = float3(world_pos_depth.x, world_pos_depth.y, world_pos_depth.z);
+    //Result[id.xy] = ShadowFactor(test_world_pos) * float4(1, 1, 1, 1);
+
+    //sdsd
+    
+        // apply the light matrix to the current sample point to get the ss position from the lights persepctive
+       /* float4 frag_pos_light_space = mul(Light_VP, float4(world_pos_depth.xyz, 1.0));
+        float3 proj_coords = frag_pos_light_space.xyz / frag_pos_light_space.w;
+        proj_coords = proj_coords * 0.5 + 0.5;
+        // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
+        float closest_depth = MainShadowmapCopy.SampleLevel(sampler_MainShadowmapCopy, proj_coords.xy,0).r;
+
+        // get depth of current fragment from light's perspective
+        float current_depth = proj_coords.z;
+        //// check whether current frag pos is in shadow
+   
+
+        // The current depth represents the depth value of the current sample world position as seen from the light's perspective.
+        // The goal is to comapre if this value is further than the value stored in the depth texture. 
+        // If I also have the worldposition in that texture, then i should be able to apply the light_VP to that world pposition and check the z val
+
+        float shadow = current_depth > closest_depth ? 1.0 : 0.0;
+        Result[current_ss_id] = float4(world_pos_depth.xyz,1) * (1-shadow);*/
+
+        /*
+        if(closest_depth == 0.0)
+            Result[current_ss_id] = float4(1,1,0,1);
+        else if(current_depth > closest_depth)
+            Result[current_ss_id] = float4(1,0,0,1);
+        else if(current_depth < closest_depth)
+            Result[current_ss_id] =float4(0,1,0,1);
+        else
+           Result[current_ss_id] =float4(0,0,1,1);*/
+}
+
+
+    /*
+	// Shadow Coordinates setup for directional light
+				// ----------------------------------------------------------------
+
+				//float  vDepth  = distance(_WorldSpaceCameraPos, float4(outS.p.xyz, 1.));			//An alternative to calculate the depth
+				float  vDepth = outS.t;																// the distance to camera is used to deterimne which cascaded to use
+				
+				// The _LightSplitsNear contains the near planes (starts) of each cascaded regions. The four floats correspond to the 
+				// begining values of the four cascaded in world space units. The _LightSplitsFar is the same but for the far plane. 
+				// so _LightSplitsNear.x and _LightSplitsFar.x give you the first cascaded region from beging to the end in world space units.
+
+				float4 near    = float4 (vDepth >= _LightSplitsNear);								// Checking if the pixel is further away than the near plane for each cascaded				
+				float4 far     = float4 (vDepth < _LightSplitsFar);									// same but for closer than far plane for each cascaded
+				float4 weights = near * far;														// only have one in xyzw for a depth that is both further away than the near plane and closer than far plane (in subfrusta)
+
+				// Calculate the shadowmap UV coordinate for each cascaded. unity_WorldToShadow is a array of four matrices, 
+				// containting the world to camera space transformation matrix for the directional light camera. Each entery of
+				// the array is for one of the cascaded cordinate systems. 
+
+				float3 shadowCoord0 = mul(unity_WorldToShadow[0], float4(outS.p.xyz, 1.)).xyz;		
+				float3 shadowCoord1 = mul(unity_WorldToShadow[1], float4(outS.p.xyz, 1.)).xyz;
+				float3 shadowCoord2 = mul(unity_WorldToShadow[2], float4(outS.p.xyz, 1.)).xyz;
+				float3 shadowCoord3 = mul(unity_WorldToShadow[3], float4(outS.p.xyz, 1.)).xyz;
+
+
+				float3 coord =									// A smart way to avoid branching. Calculating the final shadow texture uv coordinates per fragment
+					shadowCoord0 * weights.x +					// case: Cascaded one
+					shadowCoord1 * weights.y +					// case: Cascaded two
+					shadowCoord2 * weights.z +					// case: Cascaded three
+					shadowCoord3 * weights.w;					// case: Cascaded four
+
+				float shadowmask =  tex2D(m_ShadowmapCopy, coord.xy).r;*/

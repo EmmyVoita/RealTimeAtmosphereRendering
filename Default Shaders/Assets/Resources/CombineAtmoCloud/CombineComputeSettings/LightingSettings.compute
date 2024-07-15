@@ -1,0 +1,40 @@
+
+#ifndef LIGHTING_SETTINGS_COMPUTE
+#define LIGHTING_SETTINGS_COMPUTE
+
+    // Float:
+    float power;
+    float atmoPower;
+    float scatteringDensityMultiplier;
+    float lightAbsorptionThroughCloud;
+    float lightAbsorptionTowardSun;
+    float darknessThreshold;
+    
+
+    // Vector:
+  
+    float4 phaseParams;
+  
+
+    // Custom scattering coefficents for cloud lighting
+    float3 cloudSigmaS;
+    float3 cloudSigmaE;
+
+    //  Blend factor between the custom cloud scattering and the atmosphere scattering coefficients
+    float customCloudBlendFactor;
+
+    // Atmsopheric fog
+    float fogFactor;
+    uint EXIT_CLOUD_COUNT;
+
+    // LightMarch Settings:
+    float BEER_POWDER_BLEND_FACTOR;
+    float BEER_POWDER_POWER;
+    float BEER_POWDER_SCALAR;
+
+    // Luminance Setttings:
+    float CLOUD_AMBIENT_FACTOR;
+    float CLOUD_ATMOSPHERE_FACTOR;
+    float LIGHT_MARCH_INFLUENCE;
+
+#endif

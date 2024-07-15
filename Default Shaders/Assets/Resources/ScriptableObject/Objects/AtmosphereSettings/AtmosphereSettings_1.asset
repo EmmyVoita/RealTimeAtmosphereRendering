@@ -1,0 +1,22 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d4984ad450e0cec4cb672808f285e90c, type: 3}
+  m_Name: AtmosphereSettings_1
+  m_EditorClassIdentifier: 
+  _World_Position_Texture: {fileID: 8400000, guid: dd7b697ddaeda8e4194da931c3a69567, type: 2}
+  planet_center: {x: 0, y: 0, z: 0}
+  planet_radius: 254840
+  atmoHeightOffset: 0
+  atmosphereRadiusOffset: -1000
+  matchEarthRatio: 1
+  rayleighWeight: 1
+  mieWeight: 1

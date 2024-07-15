@@ -1,0 +1,22 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4f28aa59144eee54482dc3b812bbfd26, type: 3}
+  m_Name: RayMarchSetting_1
+  m_EditorClassIdentifier: 
+  STEPS_LIGHT: 6
+  STEPS_PRIMARY: 48
+  useDithering: 1
+  blueNoise: {fileID: 2800000, guid: 5bb92e256168a454aa369217d922e1b3, type: 3}
+  rayOffsetStrength: 10
+  NUM_ATMO_SAMPLES: 16
+  NUM_CLOUD_SAMPLES: 48
+  MAX_SAMPLE_COUNT: 64

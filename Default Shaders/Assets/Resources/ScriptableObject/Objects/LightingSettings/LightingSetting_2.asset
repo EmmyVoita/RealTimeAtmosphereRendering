@@ -1,0 +1,36 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 6d8bf737021832a4d9484b742bf87777, type: 3}
+  m_Name: LightingSetting_2
+  m_EditorClassIdentifier: 
+  power: 200
+  atmoPower: 0.8
+  BEER_POWDER_BLEND_FACTOR: 0.5
+  BEER_POWDER_POWER: 1
+  BEER_POWDER_SCALAR: 0.25
+  scatteringDensityMultiplier: 0.5
+  lightAbsorptionThroughClouds: 1
+  lightAbsorptionTowardsSun: 1
+  darknessThreshold: 0.2
+  forwardScattering: 0.1
+  backScattering: 0.3
+  baseBrightness: 0
+  phaseFunctionMultiplier: 1
+  useColoredScattering: 0
+  cloudSigmaS: {x: 0.5, y: 0.5, z: 0.5}
+  cloudSigmaE: {x: 0.5, y: 0.5, z: 0.5}
+  blendFactor: 0.5
+  fogFactor: 1
+  EXIT_CLOUD_COUNT: 10
+  CLOUD_AMBIENT_INFLUENCE: 0.5
+  CLOUD_ATMOSPHERE_INFLUENCE: 0.125
+  LIGHT_MARCH_INFLUENCE: 1

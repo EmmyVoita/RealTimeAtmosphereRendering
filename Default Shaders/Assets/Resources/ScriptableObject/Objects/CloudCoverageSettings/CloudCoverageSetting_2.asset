@@ -1,0 +1,34 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a63188fe241ae3340b00f9e7d8f9b078, type: 3}
+  m_Name: CloudCoverageSetting_2
+  m_EditorClassIdentifier: 
+  cloudCoverageTexture: {fileID: 2800000, guid: 9f006fab6c105ad49b0ec786f0a1de01, type: 3}
+  coverageOffset: {x: 0, y: 0}
+  coverageTiling: {x: 1, y: 1}
+  useTextureStep: 0
+  coverageTextureStep: 0
+  coverageTextureOffset: 0.08
+  topHeightOffset: 0.32
+  bottomHeight: 0.22
+  topHeight: 0.54
+  height_gradient: {fileID: 2800000, guid: 90aee18b0751bef4b8068829f764e0da, type: 3}
+  density_gradient: {fileID: 2800000, guid: 4f5e3176ff8790243bb1f1c0e95610c9, type: 3}
+  density_gradient_scalar: 1
+  viewerEnabled: 1
+  perspectiveMode: 1
+  activeChannel: 0
+  viewerGreyscale: 1
+  viewerShowAllChannels: 0
+  viewerSliceDepth: 0
+  viewerTileAmount: 1
+  viewerSize: 0.373

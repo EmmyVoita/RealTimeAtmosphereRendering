@@ -1,0 +1,323 @@
+﻿#pragma kernel CSWorley
+#pragma kernel CSNormalize
+
+static const uint UI0 = 1597334673U;
+static const uint UI1 = 3812015801U;
+static const uint2 UI2 = uint2(UI0, UI1);
+static const uint3 UI3 = uint3(UI0, UI1, 2798796415U);
+static const float UIF = 1.0 / float(0xffffffffU);
+static const int numThreads = 8;
+static const int minMaxAccuracy = 10000000;
+
+
+uint resolution;
+RWTexture3D<float4> Result;
+RWStructuredBuffer<int> minMax;
+StructuredBuffer<float3> pointsA;
+StructuredBuffer<float3> pointsB;
+StructuredBuffer<float3> pointsC;
+
+int numCellsA;
+int numCellsB;
+int numCellsC;
+
+float perlin_frequency;
+int perlin_octaves;
+
+float4 channelMask;
+float persistence;
+float perlinRemapMin;
+float perlinRemapMax;
+bool invertCombinedNoise;
+bool usePerlinWorley;
+bool showJustPerlin;
+bool invertWorley;
+int tile;
+
+bool invertPerlin;
+
+float perlinContrastExponent; // Adjust this value to control the contrast
+float worleyContrastExponent;
+
+float perlinInfluence;
+
+float remap(float v, float minOld, float maxOld, float minNew, float maxNew)
+{
+    return minNew + (v - minOld) * (maxNew - minNew) / (maxOld - minOld);
+}
+
+/*float3 hash33(float3 p)
+{
+    uint3 q = uint3(int3(p)) * UI3;
+    q = (q.x ^ q.y ^ q.z) * UI3;
+    return -1.0 + 2.0 * float3(q) * UIF;
+}*/
+
+/*float3 hash33(float3 p, float3 freq)
+{
+    p = frac(p / freq);  // Normalize and wrap the coordinates to the range [0, 1]
+    p = p - floor(p);    // Ensure values are strictly within [0, 1]
+    
+    uint3 q = uint3(int3(p) % int3(freq));  // Wrap the grid coordinates using modulo
+    q = (q.x ^ q.y ^ q.z) * UI3;
+    return -1.0 + 2.0 * float3(q) * UIF;
+}*/
+
+float3 hash33(float3 p)
+{
+    uint3 q = uint3(int3(p)) * UI3;
+    q = (q.x ^ q.y ^ q.z) * UI3;
+    return -1.0 + 2.0 * float3(q) * UIF;
+}
+
+
+float3 modulo(float3 a, float b)
+{
+    float3 result;
+    result.x = a.x - b * floor(a.x / b);
+    result.y = a.y - b * floor(a.y / b);
+    result.z = a.z - b * floor(a.z / b);
+    return result;
+}
+
+float gradientNoise(float3 x, float freq)
+{
+    // grid
+    float3 p = floor(x);
+    float3 w = frac(x);
+    
+    // quintic interpolant
+    float3 u = w * w * w * (w * (w * 6.0 - 15.0) + 10.0);
+    
+    // gradients
+    float3 ga = hash33(modulo(p + float3(0.0, 0.0, 0.0), freq));
+    float3 gb = hash33(modulo(p + float3(1.0, 0.0, 0.0), freq));
+    float3 gc = hash33(modulo(p + float3(0.0, 1.0, 0.0), freq));
+    float3 gd = hash33(modulo(p + float3(1.0, 1.0, 0.0), freq));
+    float3 ge = hash33(modulo(p + float3(0.0, 0.0, 1.0), freq));
+    float3 gf = hash33(modulo(p + float3(1.0, 0.0, 1.0), freq));
+    float3 gg = hash33(modulo(p + float3(0.0, 1.0, 1.0), freq));
+    float3 gh = hash33(modulo(p + float3(1.0, 1.0, 1.0), freq));
+
+    float va = dot(ga, w - float3(0.0, 0.0, 0.0));
+    float vb = dot(gb, w - float3(1.0, 0.0, 0.0));
+    float vc = dot(gc, w - float3(0.0, 1.0, 0.0));
+    float vd = dot(gd, w - float3(1.0, 1.0, 0.0));
+    float ve = dot(ge, w - float3(0.0, 0.0, 1.0));
+    float vf = dot(gf, w - float3(1.0, 0.0, 1.0));
+    float vg = dot(gg, w - float3(0.0, 1.0, 1.0));
+    float vh = dot(gh, w - float3(1.0, 1.0, 1.0));
+
+    return va +
+           u.x * (vb - va) +
+           u.y * (vc - va) +
+           u.z * (ve - va) +
+           u.x * u.y * (va - vb - vc + vd) +
+           u.y * u.z * (va - vc - ve + vg) +
+           u.z * u.x * (va - vb - ve + vf) +
+           u.x * u.y * u.z * (-va + vb + vc - vd + ve - vf - vg + vh);
+}
+
+
+float perlinfbm(float3 p, float freq, int octaves)
+{
+    float G = exp2(-0.85);
+    float amp = 1.0;
+    float noise = 0.0;
+
+    for (int i = 0; i < octaves; ++i)
+    {
+        noise += amp * gradientNoise(p * freq, freq);
+        freq *= 2.0;
+        amp *= G;
+    }
+
+    return noise;
+}
+
+
+
+static const int3 offsets[] =
+{
+    // centre
+    int3(0,0,0),
+    // front face
+    int3(0,0,1),
+    int3(-1,1,1),
+    int3(-1,0,1),
+    int3(-1,-1,1),
+    int3(0,1,1),
+    int3(0,-1,1),
+    int3(1,1,1),
+    int3(1,0,1),
+    int3(1,-1,1),
+    // back face
+    int3(0,0,-1),
+    int3(-1,1,-1),
+    int3(-1,0,-1),
+    int3(-1,-1,-1),
+    int3(0,1,-1),
+    int3(0,-1,-1),
+    int3(1,1,-1),
+    int3(1,0,-1),
+    int3(1,-1,-1),
+    // ring around centre
+    int3(-1,1,0),
+    int3(-1,0,0),
+    int3(-1,-1,0),
+    int3(0,1,0),
+    int3(0,-1,0),
+    int3(1,1,0),
+    int3(1,0,0),
+    int3(1,-1,0)
+};
+
+float maxComponent(float3 vec) {
+    return max(vec.x, max(vec.y, vec.z));
+}
+
+float minComponent(float3 vec) {
+    return min(vec.x, min(vec.y, vec.z));
+}
+
+
+float worley(StructuredBuffer<float3> points, int numCells, float3 samplePos) {
+    samplePos = (samplePos * tile)%1;
+    int3 cellID = floor(samplePos * numCells);
+    float minSqrDst = 1;
+
+    // Loop over current cell + 26 adjacent cells to find closest point to samplePos
+    for (int cellOffsetIndex = 0; cellOffsetIndex < 27; cellOffsetIndex ++) {
+        int3 adjID = cellID + offsets[cellOffsetIndex];
+        // Adjacent cell is outside map, so wrap around to other side to allow for seamless tiling
+        if (minComponent(adjID) == -1 || maxComponent(adjID) == numCells) {
+            int3 wrappedID = (adjID + numCells) % (uint3)numCells;
+            int adjCellIndex = wrappedID.x + numCells * (wrappedID.y + wrappedID.z * numCells);
+            float3 wrappedPoint = points[adjCellIndex];
+            // Offset the wrappedPoint by all offsets to find which is closest to samplePos
+            for (int wrapOffsetIndex = 0; wrapOffsetIndex < 27; wrapOffsetIndex ++) {
+                float3 sampleOffset = (samplePos - (wrappedPoint + offsets[wrapOffsetIndex]));
+                minSqrDst = min(minSqrDst, dot(sampleOffset, sampleOffset));
+            }
+        }
+        // Adjacent cell is inside map, so calculate sqrDst from samplePos to cell point
+        else {
+            int adjCellIndex = adjID.x + numCells * (adjID.y + adjID.z * numCells);
+            float3 sampleOffset = samplePos - points[adjCellIndex];
+            minSqrDst = min(minSqrDst, dot(sampleOffset, sampleOffset));
+        }
+    }
+    return sqrt(minSqrDst);
+}
+
+float nonLinearRemap(float value, float minValue, float maxValue, float remapMin, float remapMax)
+{
+    // Apply a non-linear remap function (you can experiment with different functions)
+    float t = smoothstep(minValue, maxValue, value);
+    return remapMin + t * t * (remapMax - remapMin);
+}
+
+
+[numthreads(numThreads,numThreads,numThreads)]
+void CSWorley (uint3 id : SV_DispatchThreadID)
+{
+    float3 pos = id / (float)resolution;
+    // Layer 3 levels of noise
+    float layerA = worley(pointsA, numCellsA, pos);
+    float layerB = worley(pointsB, numCellsB, pos);
+    float layerC = worley(pointsC, numCellsC, pos);
+
+    float noiseSum = layerA + (layerB * persistence) + (layerC * persistence * persistence);
+    float maxVal = 1 + (persistence) + (persistence * persistence);
+
+    // keep inside range [0,1] as will be clamped in texture
+    noiseSum /= maxVal;
+
+
+    // Adjust the contrast by applying a power function
+    noiseSum = pow(noiseSum, worleyContrastExponent);
+
+
+    // Invert
+    if (invertWorley) 
+    {
+        noiseSum = 1 - noiseSum;
+    }
+
+    // keep track of min max (using int to support atomic operation)
+    int val = (int)(noiseSum * minMaxAccuracy);
+    InterlockedMin(minMax[0],val);
+    InterlockedMax(minMax[1],val);
+
+    // Store result in specified channel of texture
+    Result[id] = Result[id] * (1-channelMask) + noiseSum * channelMask;
+}
+
+
+
+
+[numthreads(numThreads, numThreads, numThreads)]
+void CSNormalize(uint3 id : SV_DispatchThreadID)
+{
+    float minVal = (float)minMax[0] / minMaxAccuracy;
+    float maxVal = (float)minMax[1] / minMaxAccuracy;
+    float4 normalizedVal = (Result[id] - minVal) / (maxVal - minVal);
+
+    if(showJustPerlin == true && usePerlinWorley == false)
+    {
+        float3 pos = frac(id / (float)resolution);
+        float perlinNoise = perlinfbm(pos, perlin_frequency, perlin_octaves);
+
+        perlinNoise = remap(perlinNoise, -1., 1., 0., 1.);
+
+        // Apply global remap to push values towards 0.8
+        perlinNoise = remap(perlinNoise, 0.0, 1.0, perlinRemapMin, perlinRemapMax);
+
+        // Adjust the contrast by applying a power function
+        perlinNoise  = pow(perlinNoise, max(0,perlinContrastExponent));
+
+        if(invertPerlin)
+        {
+            perlinNoise = 1 - perlinNoise;
+        }
+
+        Result[id] = Result[id] * (1 - channelMask) + perlinNoise * channelMask;
+    }
+    else if(usePerlinWorley && !showJustPerlin)
+    {
+        float3 pos = frac(id / (float)resolution);
+        float perlinNoise = perlinfbm(pos, perlin_frequency, perlin_octaves);
+
+        perlinNoise = remap(perlinNoise, -1., 1., 0., 1.);
+
+        // Apply global remap to push values towards 0.8
+        perlinNoise = remap(perlinNoise, 0.0, 1.0, perlinRemapMin, perlinRemapMax);
+
+        // Adjust the contrast by applying a power function
+        perlinNoise  = pow(perlinNoise, max(0,perlinContrastExponent));
+
+        if(invertPerlin)
+        {
+            perlinNoise = 1 - perlinNoise;
+        }
+        
+        // Combine Perlin and Worley noise with perlinInfluence
+        float combinedNoise = (1.0 - perlinInfluence) * normalizedVal.r + perlinInfluence * perlinNoise;
+
+        // Invert combined noise if needed
+        if (invertCombinedNoise)
+        {
+            combinedNoise = 1 - combinedNoise;
+        }
+
+        //combinedNoise = nonLinearRemap(combinedNoise, 0.0, 1.0, normalizedVal, 1.0);
+
+
+        Result[id] = Result[id] * (1 - channelMask) + combinedNoise * channelMask;
+    }
+    else
+    {
+        Result[id] = Result[id] * (1 - channelMask) + normalizedVal * channelMask;
+    } 
+}
+

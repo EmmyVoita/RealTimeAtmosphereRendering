@@ -1,0 +1,94 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel compute_history
+
+int frame_counter;
+
+RWTexture2D<float4> motionVectorTexture; 
+
+RWTexture2D<float4> history_buffer;
+RWTexture2D<float4> input;
+
+uint2 CalculatePixelID(uint3 id, uint frame_num)
+{
+    // Calculate the corresponding block position
+    uint block_X = id.x / 4;
+    uint block_Y = id.y / 4;
+
+    // Calculate the pixel position within the block based on the frameCounter
+    uint column = (frame_num - 1) % 4;
+    uint row = (frame_num - 1) / 4;
+
+    // Calculate the pixel position within the 4x4 block
+    uint pixel_X = (id.x % 4) + column * 4 + block_X * 16;
+    uint pixel_Y = (id.y % 4) + row * 4 + block_Y * 16;
+
+    return uint2(pixel_X, pixel_Y);
+}
+
+[numthreads(8, 8, 1)]
+void compute_history(uint3 id : SV_DispatchThreadID)
+{
+    uint2 curr_ss_id = CalculatePixelID(id, frame_counter);
+    history_buffer[curr_ss_id] = input[curr_ss_id]; 
+
+
+    // Unfortunaley, because of the way i store data in my motion vector texture, 
+    // I can't just loop through the 4x4 block and clear the data based on the frame position as data is stored based on the reprojected id
+    // So I had to use an extra data channel to store the frame's lifetime. 16 -> 0
+    
+    // loop through the 4x4 block and decrement any non zero pixel
+    for (int i = 16; i > 0; i--)
+    {
+        // Calculate the pixel ID for the current frame
+        uint2 curr_id = CalculatePixelID(id, i);
+        float4 mv_data = motionVectorTexture[curr_id];
+
+        // If a pixel's lifetime channel reaches 0, then clear the data (as we consider it irrelevant data)
+        if((mv_data.a - 1.0) <= 0.0)
+            motionVectorTexture[curr_id] = float4(0,0,0,0);
+        else
+            motionVectorTexture[curr_id] = float4(mv_data.r, mv_data.g, mv_data.b, mv_data.a-1);
+    }
+
+
+    /*uint2 bottom_ss_id = CalculatePixelID(id, 16);
+    history_buffer[bottom_ss_id] = float4(0,0,0,0);
+
+    // Shift old frames down
+    for (int i = 1; i <= 15; i++)
+    {
+        uint2 curr_id = CalculatePixelID(id, i);
+        uint2 new_id = CalculatePixelID(id, i + 1);
+        history_buffer[new_id] = history_buffer[curr_id];
+    }
+
+    // Insert the most recent frame to the top of the history buffer
+    uint2 curr_ss_id = CalculatePixelID(id, frame_counter);
+    uint2 top_ss_id = CalculatePixelID(id, 1);
+    history_buffer[top_ss_id] = input[curr_ss_id];*/
+
+    /*
+    uint2 curr_ss_id = CalculatePixelID(id, frame_counter);
+    // Set the current frame
+    uint2 curr_ss_id = CalculatePixelID(id, frame_counter);
+    history_buffer[curr_ss_id] = input[curr_ss_id];
+
+    // Shift the data in the history buffer
+    for (int i = 15; i > 1; i--)
+    {
+        // Calculate the pixel ID for the current and previous frame
+        uint2 curr_id = CalculatePixelID(id, i);
+        uint2 prev_id = CalculatePixelID(id, i - 1);
+
+        // Copy the previous frame's data to the current frame's position
+        history_buffer[curr_id] = history_buffer[prev_id];
+    }
+
+    // Clear the first frame in the history buffer
+    uint2 first_ss_id = CalculatePixelID(id, 1);
+    history_buffer[first_ss_id] = float4(0, 0, 0, 0);
+    */
+
+    //
+}
+

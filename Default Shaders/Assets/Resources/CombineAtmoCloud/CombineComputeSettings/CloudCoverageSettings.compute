@@ -1,0 +1,35 @@
+//Cloud Coverage:
+
+bool useCoverageTextureStep;
+
+
+// Float:
+float bottomHeight;
+float topHeight;
+float topHeightOffset;
+
+float coverageTextureStep;
+float altitude_gradient_power_1;
+float altitude_gradient_power_2;
+float low_altitude_multiplier_influence;
+float density_gradient_scalar;
+
+// Vectors:
+float2 coverageTiling;
+float2 coverageOffset;
+float coverageTextureDensityOffset;
+
+// Textures:
+Texture2D<float4> CloudCoverage;
+Texture2D<float> HeightGradient;
+Texture2D<float> DensityGradient;
+
+// Texture Sampler States:
+SamplerState sampler_CloudCoverage;
+SamplerState sampler_HeightGradient;
+SamplerState sampler_DensityGradient;
+
+
+
+// Cloud Coverage
+float CLOUDS_COVERAGE;

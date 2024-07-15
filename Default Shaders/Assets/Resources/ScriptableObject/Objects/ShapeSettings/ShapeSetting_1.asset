@@ -1,0 +1,32 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a7c1e74e847762d4eb2c44c4892dce82, type: 3}
+  m_Name: ShapeSetting_1
+  m_EditorClassIdentifier: 
+  shapeNoiseScale: 5
+  shapeNoiseInfluence: 0.45
+  shapeNoiseComponentWeights: {x: 0.625, y: 0.125, z: 0.25}
+  shapeNoiseOffset: {x: 0, y: 0, z: 0}
+  CLOUDS_DETAIL_STRENGTH: 0.22
+  CLOUDS_DENSITY: 0.006
+  detailNoiseScale: 2.5
+  detailNoiseInfluence: 1
+  detailErodeWeightScalar: 1
+  detailNoiseComponentWeights: {x: 0.625, y: 0.125, z: 0.25}
+  detailNoiseOffset: {x: 0, y: 0, z: 0}
+  DETAIL_TEST_MAX: 0.3
+  CURL_NOISE_SCALE: 20
+  curlNoiseTexture: {fileID: 2800000, guid: 0cfe8751c25aeb54ca24d47b36ddedf7, type: 3}
+  curlNoiseComponentWeights: {x: 1, y: 1, z: 1}
+  densityMultiplier: 0
+  shapeDensityOffset: 0
+  detailDensityOffset: 0

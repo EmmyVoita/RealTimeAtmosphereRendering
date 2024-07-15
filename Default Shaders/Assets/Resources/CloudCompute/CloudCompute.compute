@@ -1,0 +1,807 @@
+#pragma kernel cloud_ray_march
+#include "Math.cginc"
+#include "RayMarch.cginc"
+
+int neighborhood_tile_size = 3;
+
+// ----------------------------------------------------------------------------------------------------------------------------- //
+
+float nearPlane;
+float farPlane;
+
+float4x4 _CurrV;
+float4x4 _CurrVP;
+float4x4 _PrevVP;
+float4x4 _PrevVP_NoFlip;
+
+bool initMotionVector;
+
+
+// ----------------------------------------------------------------------------------------------------------------------------- //
+
+//  to use the motion vector for reprojection,  store it in a texture and pass it to the next frame
+RWTexture2D<float4> previousFrameTexture;
+RWTexture2D<float3> worldPositionTexture;
+RWTexture2D<float4> motionVectorTexture; 
+
+RWStructuredBuffer<float4> history_frame_buffer;
+int buffer_size;
+
+
+// ----------------------------------------------------------------------------------------------------------------------------- //
+
+RWTexture2D<float4> Result;
+RWTexture2D<float4> worldPositionCloud;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float3 _WorldSpaceLightPos0;
+float3 _WorldSpaceCameraPos;
+float2 _ScreenParams;
+float current_time = 0;
+float4 _LightColor0;
+
+// ----------------------------------------------------------------------------------------------------------------------------- //
+
+Texture2D<float> _DepthTexture;
+SamplerState sampler_DepthTexture;
+
+Texture2D<float4> _MainTex;
+SamplerState sampler_MainTex;
+
+// Rendering
+int frameCounter = 1;
+
+// Textures
+Texture3D<float4> NoiseTex;
+Texture3D<float4> DetailNoiseTex;
+Texture2D<float4> WeatherMap;
+Texture2D<float> BlueNoise;
+Texture2D<float> CloudCoverage;
+Texture2D<float> HeightGradient;
+Texture2D<float> DensityGradient;
+Texture2D<float4> CurlNoiseTex;
+
+SamplerState sampler_NoiseTex;
+SamplerState sampler_DetailNoiseTex;
+SamplerState sampler_WeatherMap;
+SamplerState sampler_BlueNoise;
+SamplerState sampler_CloudCoverage;
+SamplerState sampler_HeightGradient;
+SamplerState sampler_DensityGradient;
+SamplerState sampler_CurlNoiseTex;
+
+
+// Shape settings
+float4 params;
+int3 mapSize;
+float densityMultiplier;
+float densityOffset;
+float scale;
+float detailNoiseScale;
+float detailNoiseWeight;
+float3 curl_noise_weights;
+float3 detailWeights;
+float4 shapeNoiseWeights;
+float4 phaseParams;
+
+float density_gradient_scalar;
+
+//Cloud Coverage:
+float cloud_coverage_texture_offset = 0;
+float cloud_coverage_texture_step;
+float2 coverage_tiling;
+float altitude_gradient_power_1;
+float altitude_gradient_power_2;
+float low_altitude_multiplier_influence;
+
+// March settings
+int maxLightRaySamples;
+float ray_march_step_size;
+float rayOffsetStrength;
+
+float3 boundsMin;
+float3 boundsMax;
+
+float3 shapeOffset;
+float3 detailOffset;
+
+// Light settings
+float powder_factor;
+float lightAbsorptionTowardSun;
+float lightAbsorptionThroughCloud;
+float darknessThreshold;
+
+float4 IsotropicLightTop;
+float4 IsotropicLightBottom;
+float  extinction_factor;
+
+// Animation settings
+float previous_time = 0.0;
+float timeScale;
+float baseSpeed;
+float detailSpeed;
+
+const float offsetSpeed = 1/100.0; 
+
+int maxViewRaySamples = 128;
+
+// ----------------------------------------------------------------------------------------------------------------------------- //
+
+
+
+
+struct DensityData
+{
+    float3 uvw;
+    float3 gradient_uvw;
+    float base_cloud_with_coverage;
+    float shape_FBM;
+};
+
+DensityData CreateDensityData(float3 uvw, float base_cloud_with_coverage, float shape_FBM, float3 gradient_uvw)
+{
+    DensityData densityData;
+
+    densityData.uvw = uvw;
+    densityData.base_cloud_with_coverage = base_cloud_with_coverage;
+    densityData.shape_FBM = shape_FBM;
+    densityData.gradient_uvw = gradient_uvw;
+
+    return densityData;
+}
+
+
+float3 Normalize(float3 value)
+{
+    float length = sqrt(dot(value, value));
+    return value / length;
+}
+
+
+
+
+// ----------------------------------------------------------------------------------------------------------------------------- //
+
+
+float remap(float v, float minOld, float maxOld, float minNew, float maxNew) 
+{
+    return minNew + (v-minOld) * (maxNew - minNew) / (maxOld-minOld);
+}
+
+
+float2 squareUV(float2 uv) 
+{
+    float width = _ScreenParams.x;
+    float height =_ScreenParams.y;
+    //float minDim = min(width, height);
+    float scale = 1000;
+    float x = uv.x * width;
+    float y = uv.y * height;
+    return float2 (x/scale, y/scale);
+}
+
+
+
+
+// Henyey-Greenstein
+float hg(float a, float g) 
+{
+    float g2 = g * g;
+    float numerator = 1 - g2;
+    float denominator = 4 * 3.1415 * pow(max(0, 1 + g2 - 2 * g * a), 1.5);
+    return numerator / denominator;
+}
+
+
+float phase(float a) 
+{
+    //dual-lob Henyey-Greenstein
+    float blend = .5;
+    float hgBlend = hg(a,phaseParams.x) * (1-blend) + hg(a,-phaseParams.y) * blend;
+    return phaseParams.z + hgBlend*phaseParams.w;
+}
+
+float beer(float d) 
+{
+    float beer = exp(-d);
+    return beer;
+}
+
+float remap01(float v, float low, float high) 
+{
+    return (v-low)/(high-low);
+}
+
+
+DensityData sampleBaseDensity(float3 rayPos) 
+{
+    // Constants:
+    const int mipLevel = 0;
+    const float baseScale = 1/1000.0;
+    const float offsetSpeed = 1/100.0;
+
+    // Calculate texture sample positions
+    float time = current_time.x * timeScale;
+    float3 size = boundsMax - boundsMin;
+    //size = remap(size,boundsMin, boundsMax, 0, 1);
+
+    float3 boundsCentre = (boundsMin+boundsMax) * .5;
+    float3 uvw = (size * .5 + rayPos) * baseScale * scale;
+    float3 shapeSamplePos = uvw + shapeOffset * offsetSpeed + float3(time,time*0.1,time*0.2) * baseSpeed;
+
+    // Gradient UV's
+    float heightscale = size.y / 10000;                                     //size.x;
+    float3 gradient_uvw = (rayPos - boundsMin) * baseScale * 0.1;
+    gradient_uvw.y /= heightscale;
+
+
+    // Get the Height Gradient From the Height Gradient Texture:
+    float height_gradient = HeightGradient.SampleLevel(sampler_HeightGradient, gradient_uvw.yx, 0).r;
+
+    //Get the Density Gradient From the Density Gradient Texture:
+    float density_gradient = DensityGradient.SampleLevel(sampler_DensityGradient, gradient_uvw.yx, 0).r;
+
+    
+    // Get the Cloud Coverage From the Coverage Texture:
+    float2 cloud_coverage_uv = float2(gradient_uvw.x * coverage_tiling.x, gradient_uvw.z * coverage_tiling.y);
+
+    //Add extra cloud coverage for low altitude sampling:
+    //float step_altitude = pow((1-gradient_uvw.y), altitude_gradient_power_2 * 0.01);
+    //float low_altitude_multiplier = saturate( pow((1-density_gradient), altitude_gradient_power_1) * height_gradient * step_altitude);
+    //float coverage_offset = cloud_coverage_texture_offset - low_altitude_multiplier * low_altitude_multiplier_influence; 
+
+    float cloud_coverage = CloudCoverage.SampleLevel(sampler_CloudCoverage, cloud_coverage_uv, 0).r;
+    //cloud_coverage += coverage_offset; //1-step(cloud_coverage_texture_step, cloud_coverage) + coverage_offset; 
+    
+
+    // Modify the Height Gradient using falloff at along x/z edges of the cloud container
+    const float containerEdgeFadeDst = 50;
+    float dstFromEdgeX = min(containerEdgeFadeDst, min(rayPos.x - boundsMin.x, boundsMax.x - rayPos.x));
+    float dstFromEdgeZ = min(containerEdgeFadeDst, min(rayPos.z - boundsMin.z, boundsMax.z - rayPos.z));
+    float edgeWeight = min(dstFromEdgeZ,dstFromEdgeX)/containerEdgeFadeDst;
+    
+
+    float gMin = .2;
+    float gMax = .7;
+    float heightPercent = (rayPos.y - boundsMin.y) / size.y;
+    float heightGradient = saturate(remap(heightPercent, 0.0, gMin, 0, 1)) * saturate(remap(heightPercent, 1, gMax, 0, 1));
+    height_gradient *= edgeWeight;
+
+
+    //First, we build a basic cloud shape by sampling our first 3dTexture:
+    float4 base_shape_noise = NoiseTex.SampleLevel(sampler_NoiseTex, shapeSamplePos, mipLevel);
+    float shape_FBM = base_shape_noise.g * .625 + base_shape_noise.b * .125 + base_shape_noise.a * .25; 
+    float base_cloud_density = remap(base_shape_noise.r, shape_FBM - 1., 1., 0., 1.);
+    base_cloud_density = saturate(base_cloud_density + densityOffset * .1);
+    base_cloud_density = remap(base_cloud_density, .85, 1., 0., 1.);
+    
+    base_cloud_density *= 1-cloud_coverage;
+
+    //The next step is to multiply the result by the coverage and reduce density at the bottoms of the clouds:
+    //This ensures that the bottoms will be whispy and it increases the presence of clouds in a more natural way. 
+    //Remember that density increases over altitude. Now that we have our base cloud shape, we add details.
+
+    
+    // cloud shape modeled after the GPU Pro 7 chapter
+    float base_cloud_with_coverage  = remap(base_cloud_density * height_gradient, cloud_coverage, 1.0, 0.0, 1.0);
+
+    return CreateDensityData(uvw, base_cloud_with_coverage, shape_FBM, gradient_uvw);
+}
+
+float sampleDetailDensity(DensityData densityData) 
+{
+    // Constants:
+    const int mipLevel = 0;
+    const float baseScale = 1/1000.0;
+    
+
+    // Calculate texture sample positions
+    float time = current_time.x * timeScale;
+
+
+
+    //Get the Density Gradient From the Density Gradient Texture:
+    float density_gradient = DensityGradient.SampleLevel(sampler_DensityGradient, densityData.gradient_uvw.yx, 0).r;
+
+
+    // Save sampling from detail tex if shape density <= 0
+    if (densityData.base_cloud_with_coverage > 0) 
+    {
+        // Sample detail noise
+        float3 detailSamplePos = densityData.uvw * detailNoiseScale + detailOffset * offsetSpeed + float3(time*.4,-time,time*0.1)*detailSpeed;
+        float4 detailNoise = DetailNoiseTex.SampleLevel(sampler_DetailNoiseTex, detailSamplePos, mipLevel);
+
+        // Sample the curl noise:
+        float4 curlNoise = CurlNoiseTex.SampleLevel(sampler_CurlNoiseTex, detailSamplePos.xy, mipLevel);
+
+        //Combine the detail and curl noise:
+        detailNoise *= curlNoise;
+        
+        float3 normalizedDetailWeights = detailWeights / dot(detailWeights, 1);
+        float detailFBM = dot(detailNoise.rgb, normalizedDetailWeights);
+
+        // Subtract detail noise from base shape (weighted by inverse density so that edges get eroded more than centre)
+        float oneMinusShape = 1 - densityData.shape_FBM;
+        float detailErodeWeight = oneMinusShape * oneMinusShape * oneMinusShape;
+        float cloudDensity = densityData.base_cloud_with_coverage - (1-detailFBM) * detailErodeWeight * detailNoiseWeight;
+
+        return cloudDensity * (density_gradient * densityMultiplier * 0.1);
+    }
+
+    return 0;
+}
+
+
+
+
+// Calculate proportion of light that reaches the given point from the lightsource
+
+float LightMarch(float3 position) 
+{
+
+    float3 directionToLight = _WorldSpaceLightPos0.xyz;
+    bool renderClouds;
+    float distanceInsideBox = rayBoxDst(boundsMin, boundsMax, position, 1 / directionToLight, renderClouds).y;
+    
+    float stepSize = distanceInsideBox/maxLightRaySamples;
+    float totalDensity = 0;
+
+    for (int step = 0; step < maxLightRaySamples; step++) 
+    {
+        position += directionToLight * stepSize;
+
+        DensityData densityDataSample = sampleBaseDensity(position);
+        float detailDensity = sampleDetailDensity(densityDataSample);
+
+        totalDensity += max(0, detailDensity * stepSize);
+    }
+
+    return totalDensity;
+}
+
+
+// Exponential Integral
+// (http://en.wikipedia.org/wiki/Exponential_integral)
+float Ei( float z )
+{
+    return 0.5772156649015328606065 + log( 1e-4 + abs(z) ) + z * (1.0 + z * (0.25 + z * ( (1.0/18.0) + z * ( (1.0/96.0) + z *
+    (1.0/600.0) ) ) ) ); // For x!=0
+}
+
+float3 ComputeAmbientColor ( float3 _Position, float _ExtinctionCoeff )
+{
+    float Hp = boundsMax.y - _Position.y; // Height to the top of the volume
+    float a = -_ExtinctionCoeff * Hp;
+    float3 IsotropicScatteringTop = IsotropicLightTop.rgb * max( 0.0, exp( a ) - a * Ei( a ));
+    float Hb = _Position.y - boundsMin.y; // Height to the bottom of the volume
+    a = -_ExtinctionCoeff * Hb;
+    float3 IsotropicScatteringBottom = IsotropicLightBottom.rgb * max( 0.0, exp( a ) - a * Ei( a ));
+    return IsotropicScatteringTop + IsotropicScatteringBottom;
+}
+
+//http://magnuswrenninge.com/wp-content/uploads/2010/03/Wrenninge-OzTheGreatAndVolumetric.pdf
+
+/* The main idea is to artificially lower the extinction
+coefficient σt along the shadow ray to let more light reach the
+shaded point. But rather than use a fixed scaling factor, we use
+a summation over several scales. We also adjust the local phase
+function eccentricity g and local scattering coefficient σs such
+that the total contribution of light at a given point is:*/
+
+
+float MultipleOctaveScattering(float density)
+{
+    float EXTINCTION_MULT = 1.0;
+    float attenuation = 0.2;
+    float contribution = 0.4;
+    float phaseAttenuation = 0.1;
+
+    const float scatteringOctaves = 4.0;
+
+    float a = 2.0;
+    float b = 2.0;
+    float c = 2.0;
+    float g = 0.85;
+
+    float luminance = 0.0;
+
+    for(float i = 0.0; i < scatteringOctaves; i++)
+    {
+        float phaseFunction = phase(0.3 * c);
+        float beers = exp(-density * EXTINCTION_MULT * a);
+
+        luminance += b * phaseFunction * beers;
+
+        a *= attenuation;
+        b *= contribution;
+        c *= (1.0 - phaseAttenuation);
+    }
+    return luminance;
+}
+
+
+
+
+// Z buffer to linear depth
+inline float LinearEyeDepth( float z )
+{
+    // _ZBufferParams.z = (1-far/near) / far = -9.9999
+    // _ZBufferParams.w = (far / near) / far = 10
+    //return 1.0 / (_ZBufferParams.z * z + _ZBufferParams.w);
+
+    // x is (1-far/near), y is (far/near), z is (x/far) and w is (y/far).
+
+    // https://forum.unity.com/threads/solved-what-is-lineareyedepth-doing-exactly.539791/
+    //float cameraDepth = tex2D(_CameraDepthTexture, screenPos).r;
+    //float eyeDepth = far * near / ((near - far) * cameraDepth + far);
+    //return 10000 * 0.1 / ((0.1 - 10000) * z + 10000); 
+
+    //return 1.0 / (-9.9999 * z + 10.0);
+
+    return 1.0 / z;
+}
+
+
+float linearizeDepth(float3 worldPosition, float near, float far)
+{
+    float depth = length(worldPosition - _WorldSpaceCameraPos);
+    return (depth - near) / (far - near);
+}
+
+float exponentializeDepth(float linearDepth, float near, float far, float exponentialFactor)
+{
+    linearDepth = saturate(linearDepth); // Ensure the linearDepth value is clamped between 0 and 1
+    float exponentialDepth = exp(exponentialFactor * (linearDepth - 1.0)) - exp(exponentialFactor * -1.0);
+    return (exponentialDepth - exp(exponentialFactor * -1.0)) / (exp(exponentialFactor) - exp(exponentialFactor * -1.0));
+}
+
+float magnitude2(float2 input_vector) 
+{
+    return sqrt(input_vector.x * input_vector.x + input_vector.y * input_vector.y);
+}
+
+float magnitude3(float3 input_vector) 
+{
+    return sqrt(input_vector.x * input_vector.x + input_vector.y * input_vector.y + input_vector.z * input_vector.z);
+}
+
+
+uint2 CalculatePixelID(uint3 id, uint frameNum)
+{
+     // Calculate the corresponding block position
+    uint blockX = id.x / 4;
+    uint blockY = id.y / 4;
+
+    // Calculate the pixel position within the block based on the frameCounter
+    uint column = (frameNum - 1) % 4;
+    uint row = (frameNum - 1) / 4;
+
+    // Calculate the pixel position within the 4x4 block
+    uint pixelX = (id.x % 4) + column * 4 + blockX * 16;
+    uint pixelY = (id.y % 4) + row * 4 + blockY * 16;
+
+    return uint2(pixelX, pixelY);
+}
+
+
+// ----------------------------------------------------------------------------------------------------------------------------- //
+
+[numthreads(8,8,1)]
+
+void cloud_ray_march (uint3 id : SV_DispatchThreadID)
+{
+
+    // Determine which pixel out of 4x4 block we are rendering
+    uint2 current_ss_id = CalculatePixelID(id, frameCounter);
+
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [0,1] range
+    float2 uv = (current_ss_id .xy + 0.5) / float2(width, height);
+    float2 uv2 = float2((current_ss_id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv2, _CameraToWorld, _CameraInverseProjection);
+
+    // Camera space matches OpenGL convention where cam forward is -z. In unity forward is positive z.
+    // (https://docs.unity3d.com/ScriptReference/Camera-cameraToWorldMatrix.html)
+    float3 viewVector = float3(mul(_CameraInverseProjection, float4(uv2 * 2 - 1, 0, -1)).rgb);
+    viewVector = float3(mul(_CameraToWorld, float4(viewVector,0)).rgb);
+    float viewLength = length(viewVector);
+
+
+    // Depth and cloud container intersection info:
+  
+    // --- Need to pass the depth texture info. Not availiable in compute shaders --- //
+    float nonlin_depth =  _DepthTexture.SampleLevel(sampler_DepthTexture, uv, 0).r;
+    float depth = LinearEyeDepth(nonlin_depth) * viewLength;
+    bool renderClouds;
+    float2 rayToContainerInfo = rayBoxDst(boundsMin, boundsMax, ray.position, 1 / ray.direction, renderClouds);
+
+    float dstToBox = rayToContainerInfo.x;
+    float dstInsideBox = rayToContainerInfo.y;
+    
+    
+    // point of intersection with the cloud container
+    float3 entryPoint = ray.position + ray.direction * dstToBox;
+
+    // ------------------------------------------------------------------------------------------------------------------------- //
+    // 4x4 Bayer Matrix
+    // https://www.shadertoy.com/view/sdGBzd
+    // ------------------------------------------------------------------------------------------------------------------------- //
+
+
+    // random starting offset (makes low-res results noisy rather than jagged/glitchy, which is nicer)
+    float randomOffset = BlueNoise.SampleLevel(sampler_BlueNoise, squareUV(uv*3), 0).r;
+    randomOffset *= rayOffsetStrength * 10;
+    
+    // Phase function makes clouds brighter around sun
+    float cosAngle = dot(ray.direction, _WorldSpaceLightPos0);
+    float phaseVal = phase(cosAngle);
+
+    float dstTravelled = randomOffset;
+    float dstLimit = min(depth-dstToBox, dstInsideBox);
+    
+    
+    float stepSize = ray_march_step_size;
+
+    // ------------------------------------------------------------------------------------------------------------------------- //
+    // https://www.jpgrenier.org/clouds.html
+    // To re-project the cloud volume we try to find a good approximation of the cloud's world position. 
+    // While raymarching we track a weighted sum of the absorption position and generate a motion vector from it.
+    // ------------------------------------------------------------------------------------------------------------------------- //
+
+    // March through volume:
+
+    int sampleCount = 0;
+    float view_ray_transmittance = 1;
+    float4 combined_transmittance_color = 0;
+    float3 previousRayPos = entryPoint + ray.direction * dstTravelled;
+
+    float3 weightedSum = float3(0, 0, 0);
+    float accumulatedStepSize = 0.0;
+    float accumulatedWeight = 0.0;
+
+
+    bool first_cloud = true;
+    uint exit_cloud_counter = 0;
+
+    // The powder effect (for cloud lighting) should be dependent of the view direction and sun direction:
+    float dot_view_light = remap(dot(Normalize(_WorldSpaceCameraPos.xyz), Normalize(_WorldSpaceLightPos0.xyz)),-1,1,0,1);
+
+
+    while (dstTravelled < dstLimit && sampleCount < maxViewRaySamples) 
+    {
+        // variable for base density (cheap sample):
+        float base_density = 0.0;
+
+        ray.position = entryPoint + ray.direction * dstTravelled;
+        DensityData density_data = sampleBaseDensity(ray.position);
+        base_density = density_data.base_cloud_with_coverage;
+
+        
+        // ------------------------------------------------------------------------------------------------------------------------- //
+        // Sample at 2x step size until a cloud is hit (density > 0). If the density is greater than 0, 
+        // then go back to the previous step and start stepping at 1x step size. If the next sample density is 0 (exit cloud),
+        // then go back to sampling at 2x step size. 
+        // ------------------------------------------------------------------------------------------------------------------------- //
+        
+        if (base_density > 0 && stepSize == ray_march_step_size) 
+        {
+            // Go back to the previous sample position:
+            ray.position = previousRayPos;
+
+            // Use the smaller step size in for density sampling:
+            stepSize = ray_march_step_size;
+
+            // Reset the cloud exit counter as we are likely still in the first cloud
+            exit_cloud_counter = 0;
+        }
+        else if(base_density > 0 && stepSize == 2*ray_march_step_size)
+        {
+
+            // ------------------------------------------------------------------------------------------------------------------------- //
+            // Light energy at a given sample point in the cloud as a function of
+            // Energy = Attenuation * Phase * InScattering
+            // Energy = exp(-density along light ray) * HG(cos(theta, eccentricity) * 1- exp(-density_sample))
+            // ------------------------------------------------------------------------------------------------------------------------- //
+            
+            // Density variables:
+            float detail_noise_density = 0.0;
+            float light_march_density = 0.0;
+            
+            // Ambient color variables:
+            float extinction_coefficent = 0;
+            float3 ambient_color = 0;
+
+            // Light ray transmittance variables:
+            float light_transmittance_beer = 0.0;
+
+            // View ray transmittance variables:
+            float view_ray_transmittance_beer = 0.0;
+            float view_ray_transmittance_powder = 0.0;
+            float view_ray_transmittance_beer_powder = 0.0;
+
+            // Combined transmittance variables (light ray + view ray):
+            float combined_transmittance = 0;
+
+
+
+            // Sample detail noise:
+            detail_noise_density = sampleDetailDensity(density_data);
+
+            // If and only if the result of this expensive sample is non-zero, take the additional samples along the ray from the sample point to the sun:
+            if(detail_noise_density > 0) 
+                light_march_density = LightMarch(ray.position);
+
+            // Apply multiple octave scattering to the light:
+            light_transmittance_beer = MultipleOctaveScattering(light_march_density * lightAbsorptionTowardSun);
+            light_transmittance_beer = darknessThreshold + light_transmittance_beer * (1-darknessThreshold);
+
+            // Apply the equation again for the path along the ray to the viewer (Beer-Powder):
+            view_ray_transmittance_beer = MultipleOctaveScattering(detail_noise_density* stepSize * lightAbsorptionThroughCloud);
+            view_ray_transmittance_powder = 1.0 - MultipleOctaveScattering(detail_noise_density * stepSize * 2)  * dot_view_light  * powder_factor * .01;
+
+            // Combine the beer and beer powder effect along the view ray:
+            view_ray_transmittance_beer_powder = view_ray_transmittance_beer * view_ray_transmittance_powder;
+            view_ray_transmittance_beer_powder = darknessThreshold + view_ray_transmittance_beer_powder * (1-darknessThreshold);
+
+            // Apply the beer_powder effect to the total transmittance along the view ray:
+            view_ray_transmittance *= view_ray_transmittance_beer_powder;
+
+            // Compute the ambient color:
+            extinction_coefficent = extinction_factor * detail_noise_density;
+            ambient_color = ComputeAmbientColor(ray.position, extinction_coefficent);
+
+            // Combine the transmittance along the light ray with the transmittance along the view ray:
+            combined_transmittance = (detail_noise_density * stepSize) * view_ray_transmittance * light_transmittance_beer * phaseVal;
+
+            // Combined transmittance color:
+            combined_transmittance_color += float4(combined_transmittance * ambient_color, combined_transmittance);
+            
+            // Once the alpha of the image reaches 1 we don’t need to keep sampling so we stop the march early:
+            if(combined_transmittance_color.a >= 1.0)
+                break;
+
+            // Exit early if transmittance is close to zero as further samples won't affect the result much:
+            if (view_ray_transmittance < 0.01) 
+                break;
+            
+            // The weighted sum represents how much each ray.position contributes to the density:
+            // The idea is that higher density sample positions should contribute more to the clouds world position. 
+            // But, consider what happens when the view ray intersects multiple, clouds. The world position will 
+            // shift towards the second cloud, which could potentially result in an inaccurate world position. 
+            // Thus, we only want to cojsider the first cloud the view ray intersects with. But, what do we define as the first cloud.
+            // - first exit that lasts for x number of samples.
+
+            if(first_cloud)
+            {
+                float weight = detail_noise_density * stepSize;
+                weightedSum += ray.position * weight;
+                accumulatedWeight += weight;
+            }
+                
+        }
+        else
+        {
+            // If the base density is not greater than 0, then use lower cost sampling (larger steps):
+            stepSize = ray_march_step_size * 2;
+            exit_cloud_counter++;
+
+            // If there is enough distance between two non-zero density values, we consider it to be apart of a different cloud:
+            if(exit_cloud_counter >= 400)
+                first_cloud = false;
+        }
+
+
+        // Update the distance traveled along the ray, previous sample position, and number of samples :
+        dstTravelled += stepSize;
+        previousRayPos = ray.position;
+        sampleCount++;
+    }
+    
+
+    
+       
+    // ------------------------------------------------------------------------------------------------------------------------- //
+    // Motion Vector 
+    // Determine where the world space position will be next frame assuming constant velocity between frames
+    // ToDo: don't know if motion vector calculation is correct, need to include the detail noise maybe?
+    // ------------------------------------------------------------------------------------------------------------------------- //
+    
+    /*
+    // Constants:
+    const float baseScale = 1/1000.0;
+    const float offsetSpeed = 1/100.0;
+
+    // Calculate texture sample positions in the current frame
+    float time_current = current_time.x * timeScale;
+    float3 size = boundsMax - boundsMin;
+    float3 shapeSamplePos_current = float3(time_current, time_current * 0.1, time_current * 0.2) * baseSpeed;
+
+    float delta_time = current_time.x - previous_time.x;
+
+    // Calculate texture sample positions in the next frame
+    float time_prev = (previous_time.x) * timeScale;
+    float3 shapeSamplePos_prev = float3(previous_time, previous_time * 0.1, previous_time * 0.2) * baseSpeed;
+
+    // Estimate the motion vector based on the difference in shape sampling positions
+    float3 motion_vector_ws = (shapeSamplePos_current - shapeSamplePos_prev) / delta_time;
+
+    // Get the previous pixel location of 4x4 block 
+    int previous_frame_num = frameCounter - 1;
+    if(previous_frame_num == 0)
+        previous_frame_num = 16;
+    uint2 previous_frame_ss_id = CalculatePixelID(id, previous_frame_num);
+
+    // Get the fragments world position in the previous frame and apply the motion vector to get position in curr frame (assuming no velocity change)
+    float3 ws_pos_prev = worldPositionTexture[previous_frame_ss_id]; 
+    float3 ws_pos_curr = ws_pos_prev + motion_vector_ws; 
+
+    // Determine the cs_pos of the fragment after applying the motion vector
+    float4 cs_xy_curr = mul(_PrevVP_NoFlip, float4(ws_pos_curr, 1.0));
+    float2 ndc_prev = cs_xy_curr.xy / cs_xy_curr.w;
+    float2 curr_ss_uv = 0.5 * ndc_prev + 0.5;
+    uint2 anim_thread_id = uint2(curr_ss_uv * float2(width, height));
+
+    // Calculate the screen space velocity as the difference between the ss_coords
+    float2 animation_velocity_ss = (previous_frame_ss_id - anim_thread_id) / float2(width, height);
+    
+    // Combine the previous velocity from VP change with the animation
+    float2 total_velocity_ss = static_velocity_ss + animation_velocity_ss;
+    //motionVectorTexture[previous_frame_ss_id] = total_velocity_ss; 
+
+    motionVectorTexture[(int2)reproject_thread_id] = static_velocity_ss; 
+    //resultBuffer[reproject_thread_id.x + reproject_thread_id.y * mv_width] = static_velocity_ss;
+    */
+
+    // ------------------------------------------------------------------------------------------------------------------------- //
+    // Velocity Buffer Static Reprojection
+    // ------------------------------------------------------------------------------------------------------------------------- //
+    
+    // Get the previous pixel location of 4x4 block 
+    int previous_frame_num = frameCounter - 1;
+    if(previous_frame_num == 0)
+        previous_frame_num = 16;
+    uint2 previous_frame_ss_id = CalculatePixelID(id, previous_frame_num);
+
+
+    // Get the width and height of the motion vector texture
+    uint mv_height, mv_width;
+    motionVectorTexture.GetDimensions(mv_width, mv_height);
+
+    // estimate and set the current pixels world position:
+    float3 estimated_ws_pos = (weightedSum / accumulatedWeight);
+    worldPositionTexture[current_ss_id] = estimated_ws_pos;
+
+    // Determine the ss_uv for the world position in the previous frame using the previous VP matrix, this assumes the object doesnt move:
+    float4 reproject_cs_pos = mul(_PrevVP_NoFlip, float4(estimated_ws_pos, 1.0));
+    float2 reproject_ss_ndc = reproject_cs_pos.xy / reproject_cs_pos.w;
+    float2 reproject_ss_uv = 0.5 * reproject_ss_ndc + 0.5;
+
+    // Convert uv to ss_id to use for thread_id:
+    uint2 reproject_thread_id = uint2(reproject_ss_uv * float2(mv_width, mv_height));
+
+    // Initialize to camera motion using static reprojection
+    float2 static_velocity_ss = float2((int)current_ss_id.x - (int)reproject_thread_id.x, (int)current_ss_id.y - (int)reproject_thread_id.y);
+    
+    // Set the motion vector texture.
+
+    if (magnitude2(static_velocity_ss.rg) != 0)
+        motionVectorTexture[reproject_thread_id] = float4(static_velocity_ss, 0, 16);
+    else
+        motionVectorTexture[reproject_thread_id] = float4(0,0,0,0);
+
+    // ------------------------------------------------------------------------------------------------------------------------- //
+
+    // Add clouds to background 
+    float3 backgroundCol = _MainTex.SampleLevel(sampler_MainTex, uv, 0).rgb;
+    float3 cloudCol = combined_transmittance_color.rgb * _LightColor0.rgb;
+    float3 col = backgroundCol * view_ray_transmittance + cloudCol;
+    
+
+    Result[current_ss_id] = float4(col,1);
+}

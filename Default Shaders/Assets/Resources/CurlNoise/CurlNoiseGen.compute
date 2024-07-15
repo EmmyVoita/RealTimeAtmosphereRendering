@@ -1,0 +1,64 @@
+#pragma kernel CSMainCompute
+
+RWTexture2D<float3> Result;
+
+const float detailScale = 10.0;
+uint width;
+uint height;
+float2 r_noise_scale;
+float2 g_noise_scale;
+float2 b_noise_scale;
+
+float2 hash(float2 p)
+{
+    p = float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)));
+    return -1.0 + 2.0 * frac(sin(p) * 43758.5453123);
+}
+
+float noise(in float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    return lerp(
+        lerp(dot(hash(i + float2(0.0, 0.0)), f - float2(0.0, 0.0)),
+            dot(hash(i + float2(1.0, 0.0)), f - float2(1.0, 0.0)), u.x),
+        lerp(dot(hash(i + float2(0.0, 1.0)), f - float2(0.0, 1.0)),
+            dot(hash(i + float2(1.0, 1.0)), f - float2(1.0, 1.0)), u.x), u.y);
+}
+
+float2 curl(float2 fragCoord)
+{
+    float pN = noise(fragCoord + float2(0, 1));
+    float pS = noise(fragCoord - float2(0, 1));
+    float pE = noise(fragCoord + float2(1, 0));
+    float pW = noise(fragCoord - float2(1, 0));
+
+    return float2(pN - pS, -(pE - pW));
+}
+
+float3 field(float2 pos)
+{
+    return float3(curl(pos), 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void CSMainCompute(uint3 id : SV_DispatchThreadID)
+{
+    float2 position = float2(id.x,id.y) / max(width,height);
+
+    float3 fieldValue = field(position * r_noise_scale);
+    float r_fieldIntensity = 0.5 + pow(length(fieldValue.xy), 0.8);
+
+    fieldValue = field(position * g_noise_scale);
+    float g_fieldIntensity = 0.5 + pow(length(fieldValue.xy), 0.8);
+
+    fieldValue = field(position * b_noise_scale);
+    float b_fieldIntensity = 0.5 + pow(length(fieldValue.xy), 0.8);
+
+
+
+    float4 field_col = float4(r_fieldIntensity, g_fieldIntensity,b_fieldIntensity, 1.0);
+
+    Result[id.xy] = field_col.rgb;
+}

@@ -1,0 +1,602 @@
+#pragma kernel temporal_reprojection
+#pragma multi_compile __ USE_OPTIMIZATIONS
+
+
+static const float FLT_EPS = 0.00000001f;
+static const float PI = 3.141592;
+
+float sample_standard_deviation = 3.0; // Adjust this to control the spread.
+float sample_distribution_max_offset = 8.0;  // Maximum offset distance for high velocity.
+float mv_magnitude_scalar = 5.0;
+
+
+float4x4 inverse_view_matrix;
+float4x4 inverse_projection_matrix;
+float4x4 _CurrVP;
+
+
+RWTexture2D<float4> history_buffer;
+RWTexture2D<float3> world_position;
+RWTexture2D<float4> motion_vector_ss; 
+RWStructuredBuffer<float2> result_buffer;
+
+
+
+// temporal and spatial weighting factors
+float temporal_weight = 0.8f;
+float spatial_weight = 0.2f;
+
+
+int neighborhood_tile_size = 3.0f;
+
+
+
+RWTexture2D<float4> Result;
+
+
+float temporal_decay_factor = 0.8;
+int buffer_size;
+int frame_counter;
+
+uint2 CalculatePixelID(uint2 id, uint frame_num)
+{
+    if (frame_num <= 0)
+        frame_num = 1;
+    if (frame_num > 16)
+        frame_num = 16;
+
+     // Calculate the corresponding block position
+    uint block_X = id.x / 4;
+    uint block_Y = id.y / 4;
+
+    // Calculate the pixel position within the block based on the frameCounter
+    uint column = (frame_num - 1) % 4;
+    uint row = (frame_num - 1) / 4;
+
+    // Calculate the pixel position within the 4x4 block
+    uint pixel_X = (id.x % 4) + column * 4 + block_X * 16;
+    uint pixel_Y = (id.y % 4) + row * 4 + block_Y * 16;
+
+    return uint2(pixel_X, pixel_Y);
+}
+
+uint CalculateFramNum(uint2 thread_id)
+{
+     // Calculate the block position
+    uint block_X = thread_id.x / 16;
+    uint block_Y = thread_id.y / 16;
+
+    // Calculate the position within the 4x4 block
+    uint local_X = thread_id.x % 16;
+    uint local_Y = thread_id.y % 16;
+
+    // Calculate the column and row based on the local position
+    uint column = local_X / 4;
+    uint row = local_Y / 4;
+
+    // Calculate the frame number
+    uint frame_num = row * 4 + column + 1;
+
+    return frame_num;
+}
+
+float ComputeTemporalDecay(int frameNum)
+{
+    const float initialWeight = 0.9f;
+    const float finalWeight = 0.185f;
+    const float decayFactor = 16.0f;
+
+    float weight = pow(finalWeight / initialWeight, 1.0 - (frameNum / decayFactor)) * initialWeight;
+    //float weight = pow(finalWeight / initialWeight, (frameNum / decayFactor)) * initialWeight;
+    return weight;
+}
+
+float ComputeSpatialDecay(float distance_from_center)
+{
+    const float initialWeight = 1.0f;
+    const float finalWeight = 0.4f;
+    const float decayFactor = 5.0f;
+
+    float weight = pow(finalWeight / initialWeight, distance_from_center/decayFactor) * initialWeight;
+    return weight;
+}
+
+float DepthFromWorldPos(float3 world_position)
+{
+    // Transform world position to view space
+    float4 view_position = mul(float4(world_position, 1.0), inverse_view_matrix);
+
+    // Transform view space position to clip space
+    float4 clip_position = mul(view_position, inverse_projection_matrix);
+
+    // Normalize the depth component (Z) to the range [0, 1] and write it to the output
+    float depth = (clip_position.z / clip_position.w) * 0.5 + 0.5;
+
+    return depth;
+}
+  
+
+int2 GetClosestDepth(int2 pixel_thread_id)
+{
+    // Sample the world position texture at the current pixel
+    float currentDepth = DepthFromWorldPos(world_position[pixel_thread_id].rgb);
+
+    // Initialize the closest depth to the current depth
+    float closestDepth = currentDepth;
+
+    int2 closest_depth_pixel_id = pixel_thread_id;
+
+    // Iterate through the neighboring pixels in a 3x3 region
+    for (int i = -1; i <= 1; i++)
+    {
+        for (int j = -1; j <= 1; j++)
+        {
+            // Calculate the offset UV coordinates for the neighboring pixel
+            int2 offsetUV = pixel_thread_id + int2(i, j);
+
+            // Sample the world position texture at the neighboring pixel
+            float neighborDepth = DepthFromWorldPos(world_position[offsetUV].rgb);
+
+            // Update the closest depth value if the neighboring depth is closer
+            if(min(closestDepth, neighborDepth) != closestDepth)
+            {
+                closestDepth = neighborDepth;
+                closest_depth_pixel_id = offsetUV;
+            }
+        }
+    }
+
+    // Return the closest depth pixel id in the 3x3 region
+    return closest_depth_pixel_id;
+}
+
+float GaussianDistribution(float mv_magnitude, float mean, float standard_deviation)
+{
+    float a = 1.0 / (standard_deviation * sqrt(2.0 * PI));
+    float b = -0.5 / (standard_deviation * standard_deviation);
+    return a * exp(b * (mv_magnitude - mean) * (mv_magnitude - mean));
+}
+
+
+float4 ComputeSampleOffsets(float mv_magnitude)
+{
+    float4 sample_offsets;
+
+    float offset = GaussianDistribution(mv_magnitude * mv_magnitude_scalar, 0.0, sample_standard_deviation) * sample_distribution_max_offset;
+    sample_offsets.r = max(offset * 1.0 / 3.0, 0.5);
+    sample_offsets.g = max(offset * 2.0 / 3.0, 1.0);
+    sample_offsets.b = max(offset * 3.0 / 3.0, 1.5);
+    sample_offsets.a = max(offset * 4.0 / 3.0, 2.0);
+
+    return sample_offsets;
+}
+
+float4 ComputeSampleOffsets2(float mv_magnitude)
+{
+    float4 sample_offsets;
+
+    float offset = GaussianDistribution(mv_magnitude * mv_magnitude_scalar, 0.0, sample_standard_deviation) * sample_distribution_max_offset;
+    sample_offsets.r = max(offset * 1.0 / 3.0, 1.0);
+    sample_offsets.g = max(offset * 2.0 / 3.0, 2.0);
+    sample_offsets.b = max(offset * 3.0 / 3.0, 3.0);
+    sample_offsets.a = max(offset * 4.0 / 3.0, 4.0);
+
+    return sample_offsets;
+}
+
+
+float magnitude2(float2 input_vector) 
+{
+    return sqrt(input_vector.x * input_vector.x + input_vector.y * input_vector.y);
+}
+
+
+
+// From http://mathworld.wolfram.com/LagrangeInterpolatingPolynomial.html
+float4 Lagrange3rdDegreeInterpolation(float4 y0, float4 y1, float4 y2, float4 y3, float x) 
+{
+    const float x_minus_x0 = x + 1.0; // Corrected this line from "x + 1.0" to "x - 1.0"
+    const float x_minus_x1 = x;
+    const float x_minus_x2 = x - 1.0; // Corrected this line from "x - 1.0" to "x + 1.0"
+    const float x_minus_x3 = x - 2.0; // Corrected this line from "x - 2.0" to "x + 2.0"
+    const float x_minus_x0_mul_x_minus_x1 = x_minus_x0 * x_minus_x1;
+    const float x_minus_x2_mul_x_minus_x3 = x_minus_x2 * x_minus_x3;
+
+    float4 t0 = y0 * x_minus_x1 * x_minus_x2_mul_x_minus_x3 * -0.1666666f;
+    float4 t1 = y1 * x_minus_x0 * x_minus_x2_mul_x_minus_x3 * 0.5f;
+    float4 t2 = y2 * x_minus_x0_mul_x_minus_x1 * x_minus_x3 * -0.5f;
+    float4 t3 = y3 * x_minus_x0_mul_x_minus_x1 * x_minus_x2 * 0.166666f;
+
+    return t0 + t1 + t2 + t3;
+}
+
+
+
+float4 clip_aabb(float3 aabb_min, float3 aabb_max, float4 p, float4 q)
+{
+	#if USE_OPTIMIZATIONS
+		// note: only clips towards aabb center (but fast!)
+		float3 p_clip = 0.5 * (aabb_max + aabb_min);
+		float3 e_clip = 0.5 * (aabb_max - aabb_min) + FLT_EPS;
+
+		float4 v_clip = q - float4(p_clip, p.w);
+		float3 v_unit = v_clip.xyz / e_clip;
+		float3 a_unit = abs(v_unit);
+		float ma_unit = max(a_unit.x, max(a_unit.y, a_unit.z));
+
+		if (ma_unit > 1.0)
+			return float4(p_clip, p.w) + v_clip / ma_unit;
+		else
+			return q;// point inside aabb
+	#else
+		float4 r = q - p;
+		float3 rmax = aabb_max - p.xyz;
+		float3 rmin = aabb_min - p.xyz;
+
+		const float eps = FLT_EPS;
+
+		if (r.x > rmax.x + eps)
+			r *= (rmax.x / r.x);
+		if (r.y > rmax.y + eps)
+			r *= (rmax.y / r.y);
+		if (r.z > rmax.z + eps)
+			r *= (rmax.z / r.z);
+
+		if (r.x < rmin.x - eps)
+			r *= (rmin.x / r.x);
+		if (r.y < rmin.y - eps)
+			r *= (rmin.y / r.y);
+		if (r.z < rmin.z - eps)
+			r *= (rmin.z / r.z);
+
+		return p + r;
+	#endif
+}
+
+
+
+float4 NeighborhoodClamping(uint2 id, uint frame_number, float4 current_texel)
+{
+    float motion_vector_scalar = 1;
+
+    // sample 2 newer and 2 older samples in the 4x4 texel block
+    float2 texel_ID_1 = CalculatePixelID(id, frame_number + 1);
+    float2 texel_ID_2 = CalculatePixelID(id, frame_number + 2);
+    float2 texel_ID_3 = CalculatePixelID(id, frame_number - 1);
+    float2 texel_ID_4 = CalculatePixelID(id, frame_number - 2);
+
+    float2 texel_offset_ID_1 = motion_vector_ss[texel_ID_1] * motion_vector_scalar;
+    float2 texel_offset_ID_2 = motion_vector_ss[texel_ID_2] * motion_vector_scalar;
+    float2 texel_offset_ID_3 = motion_vector_ss[texel_ID_3] * motion_vector_scalar;
+    float2 texel_offset_ID_4 = motion_vector_ss[texel_ID_4] * motion_vector_scalar;
+
+    float4 c02 = history_buffer[texel_ID_1 + texel_offset_ID_1];
+    float4 c01 = history_buffer[texel_ID_2 + texel_offset_ID_2];
+    float4 c10 = history_buffer[texel_ID_3 + texel_offset_ID_3];
+    float4 c20 = history_buffer[texel_ID_4 + texel_offset_ID_4];
+
+    // calculate the min and max of the 4 samples (dont include alpha channel)
+    float3 chroma_min = min(c02.rgb, min(c01.rgb, min(c10.rgb, c20.rgb)));
+    float3 chroma_max = max(c02.rgb, max(c01.rgb, max(c10.rgb, c20.rgb)));
+
+    // clamp the current texel within the range of the min-max
+    current_texel.rgb = clamp(current_texel.rgb, chroma_min.rgb, chroma_max.rgb);
+
+    return current_texel;
+}
+
+float4 NeighborhoodClipping(uint2 id, uint frame_number, float4 current_texel, float4 motion_vector)
+{
+    // Calculate temporal weight, stored in the alpha channel of the motion vector
+    float temporal_weight = ComputeTemporalDecay(motion_vector.a);
+
+    // Offset the sampling position based on the motion vector
+    float2 offset_uv = motion_vector * temporal_weight;
+
+    current_texel = history_buffer[CalculatePixelID(id, frame_number) + offset_uv];
+
+    
+
+    // sample 4 newer and 4 older samples in the 4x4 texel block
+    float2 texel_ID_1 = CalculatePixelID(id, frame_number + 1);
+    float2 texel_ID_2 = CalculatePixelID(id, frame_number + 2);
+    float2 texel_ID_3 = CalculatePixelID(id, frame_number + 3);
+    float2 texel_ID_4 = CalculatePixelID(id, frame_number + 4);
+    float2 texel_ID_5 = CalculatePixelID(id, frame_number - 1);
+    float2 texel_ID_6 = CalculatePixelID(id, frame_number - 2);
+    float2 texel_ID_7 = CalculatePixelID(id, frame_number - 3);
+    float2 texel_ID_8 = CalculatePixelID(id, frame_number - 4);
+
+
+    float4 c01 = history_buffer[texel_ID_1];
+    float4 c02 = history_buffer[texel_ID_2];
+    float4 c03 = history_buffer[texel_ID_3];
+    float4 c04 = history_buffer[texel_ID_4];
+    float4 c10 = history_buffer[texel_ID_5];
+    float4 c20 = history_buffer[texel_ID_6];
+    float4 c30 = history_buffer[texel_ID_7];
+    float4 c40 = history_buffer[texel_ID_8];
+
+
+    // calculate the min and max of the 9 samples (dont include alpha channel)
+    float4 cmin = min(c10, min(c20, min(c30, min(c40, min(c01, min(c02, min(c03, min(c04, current_texel))))))));
+	float4 cmax = max(c10, max(c20, max(c30, max(c40, max(c01, max(c02, max(c03, max(c04, current_texel))))))));
+
+    float4 cavg = (c10 + c20 + c30 + c40 + c01 + c02 + c03 + c04 + current_texel) / 9.0;
+
+    // blend with a 5 tap 
+    float4 cmin5 = min(c01, min(c02, min(c10, min(c20, current_texel))));
+    float4 cmax5 = max(c01, max(c02, max(c10, max(c20, current_texel))));
+    float4 cavg5 = (c01 + c02 + c10 + c20 + current_texel) / 5.0;
+    cmin = 0.5 * (cmin + cmin5);
+    cmax = 0.5 * (cmax + cmax5);
+    cavg = 0.5 * (cavg + cavg5);
+
+    // clip the current texel within the range of the min-max
+    current_texel.rgba = clip_aabb(cmin.xyz, cmax.xyz, clamp(cavg, cmin, cmax), current_texel);
+
+    return current_texel;
+}
+
+float4 NeighborhoodClipping3(uint2 id, uint frame_number, float4 current_texel, float4 motion_vector)
+{
+
+    // Calculate temporal weight, stored in the alpha channel of the motion vector
+    float temporal_weight = ComputeTemporalDecay(motion_vector.a);
+
+    // Calculate the motion vector magnitude
+    float mv_magnitude = magnitude2(motion_vector.rg);
+
+    // Compute the sample offsets.
+    float4 sample_offsets = ComputeSampleOffsets2(mv_magnitude);
+
+    // Offset the sampling position based on the motion vector
+    //float2 offset_uv = motion_vector * temporal_weight;
+
+    current_texel = history_buffer[CalculatePixelID(id, frame_number)];// + offset_uv;
+    //current_texel = history_buffer[CalculatePixelID(id, frame_number)];// + offset_uv;
+
+    // sample 4 newer and 4 older samples in the 4x4 texel block
+    float2 texel_ID_1 = CalculatePixelID(id, frame_number + floor(sample_offsets.r));
+    float2 texel_ID_2 = CalculatePixelID(id, frame_number + floor(sample_offsets.g));
+    float2 texel_ID_3 = CalculatePixelID(id, frame_number + floor(sample_offsets.b));
+    float2 texel_ID_4 = CalculatePixelID(id, frame_number + floor(sample_offsets.a));
+    float2 texel_ID_5 = CalculatePixelID(id, frame_number - floor(sample_offsets.r));
+    float2 texel_ID_6 = CalculatePixelID(id, frame_number - floor(sample_offsets.g));
+    float2 texel_ID_7 = CalculatePixelID(id, frame_number - floor(sample_offsets.b));
+    float2 texel_ID_8 = CalculatePixelID(id, frame_number - floor(sample_offsets.a));
+
+
+    float4 c01 = history_buffer[texel_ID_1];
+    float4 c02 = history_buffer[texel_ID_2];
+    float4 c03 = history_buffer[texel_ID_3];
+    float4 c04 = history_buffer[texel_ID_4];
+    float4 c10 = history_buffer[texel_ID_5];
+    float4 c20 = history_buffer[texel_ID_6];
+    float4 c30 = history_buffer[texel_ID_7];
+    float4 c40 = history_buffer[texel_ID_8];
+
+    // Using the 4 surrounding samples in time estimate the color in the current frame
+    float4 predicted_color = Lagrange3rdDegreeInterpolation( c04, c01, c10, c40, 1.0);
+
+
+    // calculate the min and max of the 9 samples (dont include alpha channel)
+    float4 cmin = min(c10, min(c20, min(c30, min(c40, min(c01, min(c02, min(c03, min(c04, current_texel))))))));
+	float4 cmax = max(c10, max(c20, max(c30, max(c40, max(c01, max(c02, max(c03, max(c04, current_texel))))))));
+
+    float4 cavg = (c10 + c20 + c30 + c40 + c01 + c02 + c03 + c04 + current_texel) / 9.0;
+
+    // blend with a 5 tap 
+    float4 cmin5 = min(c01, min(c02, min(c10, min(c20, current_texel))));
+    float4 cmax5 = max(c01, max(c02, max(c10, max(c20, current_texel))));
+    float4 cavg5 = (c01 + c02 + c10 + c20 + current_texel) / 5.0;
+    cmin = 0.5 * (cmin + cmin5);
+    cmax = 0.5 * (cmax + cmax5);
+    cavg = 0.5 * (cavg + cavg5);
+
+    // clip the current texel within the range of the min-max
+    current_texel.rgba = clip_aabb(cmin.xyz, cmax.xyz, clamp(cavg, cmin, cmax), current_texel);
+
+    current_texel.rgba = lerp(current_texel, predicted_color, temporal_weight);
+
+    return current_texel;
+}
+
+
+
+float4 NeighborhoodClipping2(uint2 id, uint frame_number, float4 current_texel, float4 motion_vector)
+{
+
+    // Calculate temporal weight, stored in the alpha channel of the motion vector
+    float temporal_weight = ComputeTemporalDecay(motion_vector.a);
+
+    // Calculate the motion vector magnitude
+    float mv_magnitude = magnitude2(motion_vector.rg);
+
+    // Compute the sample offsets.
+    float4 sample_offsets = ComputeSampleOffsets(mv_magnitude);
+
+    // Offset the sampling position based on the motion vector
+    //float2 offset_uv = motion_vector * temporal_weight;
+
+    current_texel = history_buffer[CalculatePixelID(id, frame_number)];// + offset_uv;
+    //current_texel = history_buffer[CalculatePixelID(id, frame_number)];// + offset_uv;
+
+    // sample 4 newer and 4 older samples in the 4x4 texel block
+    float2 texel_ID_1 = CalculatePixelID(id, frame_number + floor(sample_offsets.r));
+    float2 texel_ID_2 = CalculatePixelID(id, frame_number + floor(sample_offsets.g));
+    float2 texel_ID_3 = CalculatePixelID(id, frame_number + floor(sample_offsets.b));
+    float2 texel_ID_4 = CalculatePixelID(id, frame_number + floor(sample_offsets.a));
+    float2 texel_ID_5 = CalculatePixelID(id, frame_number - floor(sample_offsets.r));
+    float2 texel_ID_6 = CalculatePixelID(id, frame_number - floor(sample_offsets.g));
+    float2 texel_ID_7 = CalculatePixelID(id, frame_number - floor(sample_offsets.b));
+    float2 texel_ID_8 = CalculatePixelID(id, frame_number - floor(sample_offsets.a));
+
+
+    float4 c01 = history_buffer[texel_ID_1];
+    float4 c02 = history_buffer[texel_ID_2];
+    float4 c03 = history_buffer[texel_ID_3];
+    float4 c04 = history_buffer[texel_ID_4];
+    float4 c10 = history_buffer[texel_ID_5];
+    float4 c20 = history_buffer[texel_ID_6];
+    float4 c30 = history_buffer[texel_ID_7];
+    float4 c40 = history_buffer[texel_ID_8];
+
+    // Using the 4 surrounding samples in time estimate the color in the current frame
+    float4 predicted_color = Lagrange3rdDegreeInterpolation( c04, c01, c10, c40, 1.0);
+
+
+    // calculate the min and max of the 9 samples (dont include alpha channel)
+    float4 cmin = min(c10, min(c20, min(c30, min(c40, min(c01, min(c02, min(c03, min(c04, current_texel))))))));
+	float4 cmax = max(c10, max(c20, max(c30, max(c40, max(c01, max(c02, max(c03, max(c04, current_texel))))))));
+
+    float4 cavg = (c10 + c20 + c30 + c40 + c01 + c02 + c03 + c04 + current_texel) / 9.0;
+
+    // blend with a 5 tap 
+    float4 cmin5 = min(c01, min(c02, min(c10, min(c20, current_texel))));
+    float4 cmax5 = max(c01, max(c02, max(c10, max(c20, current_texel))));
+    float4 cavg5 = (c01 + c02 + c10 + c20 + current_texel) / 5.0;
+    cmin = 0.5 * (cmin + cmin5);
+    cmax = 0.5 * (cmax + cmax5);
+    cavg = 0.5 * (cavg + cavg5);
+
+    // clip the current texel within the range of the min-max
+    current_texel.rgba = clip_aabb(cmin.xyz, cmax.xyz, clamp(cavg, cmin, cmax), current_texel);
+
+    current_texel.rgba = lerp(current_texel, predicted_color, temporal_weight);
+
+    return current_texel;
+}
+
+
+
+
+/*float3 WorldPositionTemporalInterpolation(float3 estimated_ws_pos, int current_frame, int focus_frame, uint2 focus_frame_texel_ID)
+{
+    // current frame: represents the most recently updated frame
+    // focus frame: represents the texel in the 4x4 block that we are looking at
+
+    float4 motion_vector = motion_vector_ss[focus_frame_texel_ID].rgba;
+
+    // Calculate the time difference between the current frame and the previous frame
+    float time_difference = motion_vector.a;
+
+    // Convert the motion vector from screen space to world space
+    //float4 motion_vector_ws = mul(motion_vector_ss, inverse(_CurrVP));
+
+    // Use the motion vector and time difference to estimate how far the texel has moved
+    float3 estimated_movement = motion_vector.xy * time_difference;
+
+    // Subtract the estimated movement from the current world position to get the new estimate
+    float3 updated_ws_pos = estimated_ws_pos - estimated_movement;
+
+    return updated_ws_pos;
+}*/
+
+
+
+[numthreads(8,8,1)]
+void temporal_reprojection (uint3 id : SV_DispatchThreadID)
+{
+
+    uint mv_height, mv_width;
+    motion_vector_ss.GetDimensions(mv_width, mv_height);
+    
+    // Pass the current fragment to the output texture:
+    uint2 curr_frame_ss_id = CalculatePixelID(id.xy, frame_counter);
+    Result[curr_frame_ss_id] = history_buffer[curr_frame_ss_id];
+
+
+    // Iterate through each previous frame in the 4x4 block
+    for (int i = 1; i <= 15; i++)
+    {      
+        int previous_frame_num = frame_counter - i;
+        if (previous_frame_num <= 0)
+            previous_frame_num += 16;
+
+        // Calculate the previous frame's texel id
+        uint2 previous_frame_texel_ID = CalculatePixelID(id.xy, previous_frame_num);
+
+        // Get the fragment from the history buffer that corresponds to the previous_frame_ss_id 
+        float4 current_texel = history_buffer[previous_frame_texel_ID];
+
+        // get the estimated world position using a texture lookup
+        float3 estimated_ws_pos = world_position[previous_frame_texel_ID];
+
+        // world position buffer data gets updated every 16 frames so its likley to become outdated
+        // we can handle this several way
+
+        //float3 updated_estimate_ws_pos = WorldPositionTemporalInterpolation(estimated_ws_pos, frame_counter, previous_frame_num, previous_frame_texel_ID);
+
+
+        // Get the motion vector for this texel
+        float4 motion_vector = motion_vector_ss[previous_frame_texel_ID].rgba;
+
+        // Determine the ss_uv for the world position in the current frame using the current VP matrix, this assumes the object doesnt move:
+        float4 reprojected_cs_pos = mul(_CurrVP, float4(estimated_ws_pos, 1.0));
+        float2 reprojected_ss_ndc = reprojected_cs_pos.xy / reprojected_cs_pos.w;
+        float2 reprojected_ss_uv = 0.5 * reprojected_ss_ndc + 0.5;
+
+        // Convert uv to ss_id to use for thread_id:
+        uint2 reprojected_texel_ID = uint2(reprojected_ss_uv * float2(mv_width, mv_height));
+       
+
+        //world_position[previous_frame_texel_ID] = float4(previous_ws_pos, current_texel.w);
+
+        // Store the new pixel position in the result buffer
+        // The previous frame's position will be stored at the current thread's pixel ID
+        //result_buffer[previous_frame_texel_ID.x + previous_frame_texel_ID.y * mv_width] = reprojected_ss_uv;
+
+
+        float4 test_frag = float4(0,0,0,0);
+        
+        
+        if(previous_frame_texel_ID.x < (mv_width/2) - 3 )
+        {
+            test_frag = NeighborhoodClipping3(id.xy, previous_frame_num, current_texel, motion_vector);
+            float4 test_frag2 = NeighborhoodClipping2(id.xy, previous_frame_num, current_texel, motion_vector);
+
+            if( test_frag.x != test_frag2.x || test_frag.g != test_frag2.g || test_frag.b != test_frag2.b || test_frag.a != test_frag2.a)
+                test_frag = float4(1,0,0,1);
+        }
+        else if(previous_frame_texel_ID.x >= (mv_width/2) -3 &&  previous_frame_texel_ID.x < (mv_width/2) + 3)
+        {
+            test_frag = float4(1,1,0,1);
+        }
+        else
+        {
+       
+            test_frag = NeighborhoodClipping2(id.xy, previous_frame_num, current_texel, motion_vector);
+            //if( current_texel.x == test_frag.x && current_texel.g == test_frag.g && current_texel.b == test_frag.b && current_texel.a == test_frag.a)
+                //test_frag = float4(0,1,0,1);
+            
+           
+        }
+
+        
+
+        Result[reprojected_texel_ID] = test_frag;
+
+        /*
+        if(previous_frame_texel_ID.x < (mv_width/2) - 3 )
+        {
+            Result[previous_frame_texel_ID] = current_texel;
+        }
+        else if(previous_frame_texel_ID.x >= (mv_width/2) -3 &&  previous_frame_texel_ID.x < (mv_width/2) + 3)
+        {
+            Result[previous_frame_texel_ID] = float4(1,1,0,1);
+        }
+        else
+        {
+            if(reprojected_texel_ID.x == previous_frame_texel_ID.x && reprojected_texel_ID.y == previous_frame_texel_ID.y)
+                test_frag = float4(0,1,0,1);
+            else
+                test_frag = current_texel;
+
+            Result[reprojected_texel_ID] = test_frag;
+        }*/
+            
+
+        
+    }
+}

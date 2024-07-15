@@ -1,0 +1,12 @@
+// March settings
+int STEPS_PRIMARY;
+int STEPS_LIGHT;
+int STEPS_PRIMARY_CLOUD;
+int NUM_ATMO_SAMPLES;
+int MAX_SAMPLE_COUNT;
+
+float ray_march_step_size;
+float rayOffsetStrength;
+
+Texture2D<float> BlueNoise;
+SamplerState sampler_BlueNoise;

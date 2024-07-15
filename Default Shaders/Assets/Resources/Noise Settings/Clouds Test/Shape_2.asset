@@ -1,0 +1,32 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1787afcfc474f492cb336a2bb25127ac, type: 3}
+  m_Name: Shape_2
+  m_EditorClassIdentifier: 
+  seed: 28
+  numDivisionsA: 6
+  numDivisionsB: 9
+  numDivisionsC: 11
+  persistence: 1.33
+  tile: 1
+  invertWorley: 1
+  worleyContrastExponent: 0.63
+  perlin_frequency: 4
+  perlin_octaves: 7
+  invertPerlin: 0
+  showJustPerlin: 0
+  perlinContrastExponent: 3
+  perlinRemapMin: 0.22
+  perlinRemapMax: 1
+  perlinInfluence: 0.5
+  usePerlinWorley: 0
+  invertCombinedNoise: 0
