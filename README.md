@@ -1,5 +1,7 @@
 # RealTimeAtmosphereRendering
 
+This project is old. I have a newer version. If you would like to see it you can view it here: https://emmyvoita.github.io/posts/Physically-Based-Sky-&-Cloud-Rendering/
+
 Unity real-time atmosphere rendering setup in the built-in render pipeline. Includes both physically based atmosphere and cloud rendering. Included in this respository are the main scripts, but I also included the entire project via dropbox link.
 
 ![image](https://github.com/EmmyVoita/RealTimeAtmosphereRendering/assets/82542924/47589679-5fcc-4fc5-a831-8f5790bdf954)
